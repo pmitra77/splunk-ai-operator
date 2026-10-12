@@ -2,6 +2,8 @@ package agentruntime
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -10,9 +12,89 @@ import (
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/yaml"
 )
+
+func TestLASRolloutPolicyReachesBothDeployments(t *testing.T) {
+	ai := &aiv1.AIService{}
+	ai.Name = "fixture"
+	ai.Spec.Feature = aiv1.FeatureSpec{
+		LicenseSecretRef:  "offline-license",
+		PostgresSecretRef: "fixture-postgres",
+		RedisSecretRef:    "fixture-redis",
+		LAS: &aiv1.LASFeatureSpec{
+			Image:       aiv1.LASImageSpec{Repository: "registry.example/fixture", Tag: "candidate-123"},
+			AssistantID: "contract_fixture",
+		},
+	}
+
+	values := lasValues(ai)
+	apiValues := values["apiServer"].(map[string]interface{})
+	queueValues := values["queue"].(map[string]interface{})
+	if apiValues["autoscaling"].(map[string]interface{})["enabled"] != false || apiValues["deployment"].(map[string]interface{})["replicaCount"] != 1 {
+		t.Fatal("API is not fixed at one replica")
+	}
+	apiStrategy := apiValues["deployment"].(map[string]interface{})["strategy"].(map[string]interface{})
+	queueStrategy := queueValues["deployment"].(map[string]interface{})["strategy"].(map[string]interface{})
+	if apiStrategy["type"] != "RollingUpdate" || queueStrategy["type"] != "RollingUpdate" {
+		t.Fatal("both workloads must request RollingUpdate")
+	}
+	for name, strategy := range map[string]map[string]interface{}{"API": apiStrategy, "queue": queueStrategy} {
+		rolling := strategy["rollingUpdate"].(map[string]interface{})
+		if rolling["maxSurge"] != 0 || rolling["maxUnavailable"] != 1 {
+			t.Errorf("%s requested rollout policy = %#v", name, rolling)
+		}
+	}
+	oldValues := lasValues(ai)
+	delete(oldValues["apiServer"].(map[string]interface{})["deployment"].(map[string]interface{}), "strategy")
+	delete(oldValues["queue"].(map[string]interface{})["deployment"].(map[string]interface{}), "strategy")
+	if sameValues(oldValues, values) || !sameValues(values, lasValues(ai)) {
+		t.Fatal("the rollout value change must cause one upgrade, then compare equal")
+	}
+
+	digest := sha256.Sum256(lasChartArchive)
+	if hex.EncodeToString(digest[:]) != lasChartSHA256 {
+		t.Fatal("embedded LAS chart digest differs from pinned identity")
+	}
+	chart, err := loader.LoadArchive(bytes.NewReader(lasChartArchive))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chart.Metadata.Version != lasChartVersion {
+		t.Fatalf("embedded LAS chart version = %q, want %q", chart.Metadata.Version, lasChartVersion)
+	}
+	renderValues, err := chartutil.ToRenderValues(chart, values, chartutil.ReleaseOptions{Name: "las-fixture", Namespace: "default"}, chartutil.DefaultCapabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := engine.Render(chart, renderValues)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, template := range map[string]string{
+		"API":   "langgraph-cloud/templates/api-server/deployment.yaml",
+		"queue": "langgraph-cloud/templates/queue/deployment.yaml",
+	} {
+		var deployment appsv1.Deployment
+		if err := yaml.Unmarshal([]byte(rendered[template]), &deployment); err != nil {
+			t.Fatalf("parse %s Deployment: %v", name, err)
+		}
+		strategy := deployment.Spec.Strategy
+		if strategy.Type != appsv1.RollingUpdateDeploymentStrategyType || strategy.RollingUpdate == nil || strategy.RollingUpdate.MaxSurge == nil || strategy.RollingUpdate.MaxUnavailable == nil {
+			t.Fatalf("%s Deployment has no explicit RollingUpdate strategy: %#v", name, strategy)
+		}
+		if *strategy.RollingUpdate.MaxSurge != intstr.FromInt32(0) || *strategy.RollingUpdate.MaxUnavailable != intstr.FromInt32(1) {
+			t.Errorf("%s Deployment rendered rollout policy = %#v", name, strategy.RollingUpdate)
+		}
+		if name == "API" && (deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 1) {
+			t.Errorf("API Deployment replicas = %v, want one", deployment.Spec.Replicas)
+		}
+	}
+}
 
 func TestLASValuesSelectImageAndKeepRunContextOut(t *testing.T) {
 	ai := &aiv1.AIService{}

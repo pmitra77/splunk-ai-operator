@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - README badges reorganized into logical categories
 - Modular GitHub Actions workflows using `workflow_call`
+- LAS API and queue Deployments now use a versioned zero-surge, one-unavailable rollout policy during operator installs and upgrades.
 
 ### Documentation
 - Added deployment guides for EKS and k0s clusters

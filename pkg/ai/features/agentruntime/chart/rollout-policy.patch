@@ -1,0 +1,56 @@
+--- a/langgraph-cloud/Chart.yaml
++++ b/langgraph-cloud/Chart.yaml
+@@ -7,4 +7,4 @@
+   name: Ankush
+ name: langgraph-cloud
+ type: application
+-version: 0.3.4
++version: 0.3.5-splunk.1
+--- a/langgraph-cloud/values.yaml
++++ b/langgraph-cloud/values.yaml
+@@ -112,6 +112,11 @@
+   containerPort: 8000
+   deployment:
+     replicaCount: 1
++    strategy:
++      type: RollingUpdate
++      rollingUpdate:
++        maxSurge: 0
++        maxUnavailable: 1
+     labels: {}
+     annotations: {}
+     podSecurityContext: {}
+@@ -196,6 +201,11 @@
+   containerPort: 8000
+   deployment:
+     replicaCount: 1
++    strategy:
++      type: RollingUpdate
++      rollingUpdate:
++        maxSurge: 0
++        maxUnavailable: 1
+     labels: {}
+     annotations: {}
+     podSecurityContext: {}
+--- a/langgraph-cloud/templates/api-server/deployment.yaml
++++ b/langgraph-cloud/templates/api-server/deployment.yaml
+@@ -20,6 +20,8 @@
+   {{- if not .Values.apiServer.autoscaling.enabled }}
+   replicas: {{ .Values.apiServer.deployment.replicaCount }}
+   {{- end }}
++  strategy:
++    {{- toYaml .Values.apiServer.deployment.strategy | nindent 4 }}
+   selector:
+     matchLabels:
+       {{- include "langGraphCloud.selectorLabels" . | nindent 6 }}
+--- a/langgraph-cloud/templates/queue/deployment.yaml
++++ b/langgraph-cloud/templates/queue/deployment.yaml
+@@ -21,6 +21,8 @@
+   {{- if not .Values.queue.autoscaling.enabled }}
+   replicas: {{ .Values.queue.deployment.replicaCount }}
+   {{- end }}
++  strategy:
++    {{- toYaml .Values.queue.deployment.strategy | nindent 4 }}
+   selector:
+     matchLabels:
+       {{- include "langGraphCloud.selectorLabels" . | nindent 6 }}

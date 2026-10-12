@@ -31,13 +31,13 @@ import (
 )
 
 const (
-	lasChartVersion                   = "0.3.4"
-	lasChartSHA256                    = "31dab99c9b1c6ddfb8672a4a9a287a044d50bb628665c641eb2b1170833df953"
+	lasChartVersion                   = "0.3.5-splunk.1"
+	lasChartSHA256                    = "ef80afdef0c44a232946e67dc84521bed4e2b3a0234643eafc2ec811b6b092c8"
 	lasOwnerLabel                     = "ai.splunk.com/aiservice-uid"
 	defaultAgentRuntimeHTTPPort int32 = 8080
 )
 
-//go:embed chart/langgraph-cloud-0.3.4.tgz
+//go:embed chart/langgraph-cloud-0.3.5-splunk.1.tgz
 var lasChartArchive []byte
 
 // LASReconciler replaces the direct-managed agentruntime workload with LAS.
@@ -205,6 +205,7 @@ func lasValues(ai *aiv1.AIService) map[string]interface{} {
 		"queue": map[string]interface{}{
 			"enabled": true,
 			"deployment": map[string]interface{}{
+				"strategy":       lasRolloutStrategyValues(),
 				"resources":      lasWorkloadResources(ai.Spec.Feature.LAS.Queue, "1"),
 				"startupProbe":   lasProbeValues(ai.Spec.Feature.LAS.Queue.StartupProbe, false),
 				"readinessProbe": lasProbeValues(ai.Spec.Feature.LAS.Queue.ReadinessProbe, false),
@@ -212,7 +213,10 @@ func lasValues(ai *aiv1.AIService) map[string]interface{} {
 			},
 		},
 		"apiServer": map[string]interface{}{
+			"autoscaling": map[string]interface{}{"enabled": false},
 			"deployment": map[string]interface{}{
+				"replicaCount":   1,
+				"strategy":       lasRolloutStrategyValues(),
 				"resources":      lasWorkloadResources(ai.Spec.Feature.LAS.API, "250m"),
 				"startupProbe":   lasProbeValues(ai.Spec.Feature.LAS.API.StartupProbe, true),
 				"readinessProbe": lasProbeValues(ai.Spec.Feature.LAS.API.ReadinessProbe, true),
@@ -240,6 +244,16 @@ func lasValues(ai *aiv1.AIService) map[string]interface{} {
 		values["images"].(map[string]interface{})["imagePullSecrets"] = refs
 	}
 	return values
+}
+
+func lasRolloutStrategyValues() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "RollingUpdate",
+		"rollingUpdate": map[string]interface{}{
+			"maxSurge":       0,
+			"maxUnavailable": 1,
+		},
+	}
 }
 
 func lasWorkloadResources(workload aiv1.LASWorkloadSpec, defaultCPURequest string) map[string]interface{} {

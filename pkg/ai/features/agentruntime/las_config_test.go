@@ -156,8 +156,12 @@ func TestLASTracingSettingsReachAPIAndQueueWorkloads(t *testing.T) {
 		},
 	}
 	disabledValues := lasValues(ai)
-	ai.Spec.Feature.LAS.Tracing.Enabled = true
 	ai.Spec.Feature.LAS.Tracing.Endpoint = "https://langsmith.internal"
+	endpointValues := lasValues(ai)
+	if sameValues(disabledValues, endpointValues) {
+		t.Fatal("changing the tracing endpoint must change the Helm values even when tracing is disabled")
+	}
+	ai.Spec.Feature.LAS.Tracing.Enabled = true
 	values := lasValues(ai)
 	if sameValues(disabledValues, values) {
 		t.Fatal("changing tracing settings must change the Helm values and trigger an upgrade")

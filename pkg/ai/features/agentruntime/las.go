@@ -289,7 +289,7 @@ func applyLASTracing(values map[string]interface{}, tracing *aiv1.LASTracingSpec
 	extraEnv := []map[string]interface{}{
 		{"name": "LANGSMITH_TRACING", "value": fmt.Sprintf("%t", tracing.Enabled)},
 	}
-	if tracing.Enabled && tracing.Endpoint != "" {
+	if tracing.Endpoint != "" {
 		extraEnv = append(extraEnv, map[string]interface{}{"name": "LANGSMITH_ENDPOINT", "value": tracing.Endpoint})
 	}
 	for _, workload := range []string{"apiServer", "queue"} {

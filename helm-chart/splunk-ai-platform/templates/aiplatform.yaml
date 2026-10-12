@@ -53,6 +53,14 @@ spec:
           repository: {{ .las.image.repository | quote }}
           tag: {{ .las.image.tag | quote }}
         assistantId: {{ .las.assistantId | quote }}
+{{ with .las.api }}
+        api:
+{{ toYaml . | nindent 10 }}
+{{ end }}
+{{ with .las.queue }}
+        queue:
+{{ toYaml . | nindent 10 }}
+{{ end }}
 {{- end }}
 {{- if .licenseSecretRef }}
       licenseSecretRef: {{ .licenseSecretRef | quote }}

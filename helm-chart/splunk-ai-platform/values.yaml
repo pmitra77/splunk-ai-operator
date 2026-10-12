@@ -74,6 +74,20 @@ features: []
 #       repository: "registry.example.com/agent-server"
 #       tag: "1.0.0"
 #     assistantId: "assistant-id"
+#     api:
+#       resources:
+#         requests:
+#           cpu: "500m"
+#       startupProbe:
+#         timeoutSeconds: 7
+#       nodeSelector:
+#         workload: "las-api"
+#     queue:
+#       resources:
+#         requests:
+#           cpu: "2"
+#       nodeSelector:
+#         workload: "las-queue"
 #   licenseSecretRef: "las-auth"
 #   postgresSecretRef: "las-postgres"
 #   redisSecretRef: "las-redis"

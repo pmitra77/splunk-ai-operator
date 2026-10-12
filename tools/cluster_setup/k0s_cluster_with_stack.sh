@@ -4839,6 +4839,60 @@ wait_for_splunk_standalone() {
 }
 
 # ====== INSTALL AI PLATFORM CR ======
+yaml_single_quote() {
+  local value="${1//\'/\'\'}"
+  printf "'%s'" "${value}"
+}
+
+# Render only the allow-listed LAS custom-resource settings. Deployment-only
+# credential values in the installer config are deliberately never copied;
+# the resulting feature carries Secret references at the FeatureSpec level.
+render_las_feature_yaml() {
+  local config_file="$1" feature_index="$2" network_mode="$3"
+  local repository tag assistant_id tracing_enabled tracing_endpoint
+  local api_resources queue_resources autoscaling_enabled min_replicas max_replicas target_cpu
+  local rendered="      las:"$'\n'
+
+  repository=$(yq eval ".aiPlatform.features[${feature_index}].las.image.repository // \"\"" "${config_file}" 2>/dev/null || echo "")
+  tag=$(yq eval ".aiPlatform.features[${feature_index}].las.image.tag // \"\"" "${config_file}" 2>/dev/null || echo "")
+  assistant_id=$(yq eval ".aiPlatform.features[${feature_index}].las.assistantId // \"\"" "${config_file}" 2>/dev/null || echo "")
+  tracing_enabled=$(yq eval ".aiPlatform.features[${feature_index}].las.tracing.enabled // \"false\"" "${config_file}" 2>/dev/null || echo "false")
+  tracing_endpoint=$(yq eval ".aiPlatform.features[${feature_index}].las.tracing.endpoint // \"\"" "${config_file}" 2>/dev/null || echo "")
+  api_resources=$(yq eval ".aiPlatform.features[${feature_index}].las.api.resources // {}" "${config_file}" 2>/dev/null || echo "{}")
+  queue_resources=$(yq eval ".aiPlatform.features[${feature_index}].las.queue.resources // {}" "${config_file}" 2>/dev/null || echo "{}")
+  autoscaling_enabled=$(yq eval ".aiPlatform.features[${feature_index}].las.queue.autoscaling.enabled // \"false\"" "${config_file}" 2>/dev/null || echo "false")
+  min_replicas=$(yq eval ".aiPlatform.features[${feature_index}].las.queue.autoscaling.minReplicas // 1" "${config_file}" 2>/dev/null || echo "1")
+  max_replicas=$(yq eval ".aiPlatform.features[${feature_index}].las.queue.autoscaling.maxReplicas // 3" "${config_file}" 2>/dev/null || echo "3")
+  target_cpu=$(yq eval ".aiPlatform.features[${feature_index}].las.queue.autoscaling.targetCPUUtilizationPercentage // 80" "${config_file}" 2>/dev/null || echo "80")
+
+  rendered+="        image:"$'\n'
+  rendered+="          repository: $(yaml_single_quote "${repository}")"$'\n'
+  rendered+="          tag: $(yaml_single_quote "${tag}")"$'\n'
+  rendered+="        assistantId: $(yaml_single_quote "${assistant_id}")"$'\n'
+  rendered+="        networkMode: ${network_mode}"$'\n'
+  rendered+="        tracing:"$'\n'
+  rendered+="          enabled: ${tracing_enabled}"$'\n'
+  if [[ -n "${tracing_endpoint}" && "${tracing_endpoint}" != "null" ]]; then
+    rendered+="          endpoint: $(yaml_single_quote "${tracing_endpoint}")"$'\n'
+  fi
+
+  if [[ -n "${api_resources}" && "${api_resources}" != "{}" && "${api_resources}" != "null" ]]; then
+    rendered+="        api:"$'\n'"          resources:"$'\n'
+    while IFS= read -r line; do rendered+="            ${line}"$'\n'; done <<< "${api_resources}"
+  fi
+  rendered+="        queue:"$'\n'
+  if [[ -n "${queue_resources}" && "${queue_resources}" != "{}" && "${queue_resources}" != "null" ]]; then
+    rendered+="          resources:"$'\n'
+    while IFS= read -r line; do rendered+="            ${line}"$'\n'; done <<< "${queue_resources}"
+  fi
+  rendered+="          autoscaling:"$'\n'
+  rendered+="            enabled: ${autoscaling_enabled}"$'\n'
+  rendered+="            minReplicas: ${min_replicas}"$'\n'
+  rendered+="            maxReplicas: ${max_replicas}"$'\n'
+  rendered+="            targetCPUUtilizationPercentage: ${target_cpu}"$'\n'
+  printf '%s' "${rendered}"
+}
+
 install_ai_platform_cr() {
   log "============================================"
   log "Creating AIPlatform Custom Resource"
@@ -5059,7 +5113,7 @@ EOF
     log "Reading ${feature_count} feature(s) from config..."
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver fsa fprovider fenv_yaml flas_repository flas_tag fassistant_id las_ref las_value
+      local fname fver fsa fprovider fenv_yaml flas_repository flas_tag fassistant_id las_ref las_value las_network_mode las_yaml
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}" 2>/dev/null || echo "1.0.0")
       fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -5076,12 +5130,12 @@ EOF
           las_value=$(yq eval ".aiPlatform.features[$i].${las_ref} // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
           [[ -n "$las_value" && "$las_value" != "null" ]] && features_yaml+="      ${las_ref}: \"${las_value}\""$'\n'
         done
-        if [[ -n "$flas_repository" && "$flas_repository" != "null" && -n "$flas_tag" && "$flas_tag" != "null" && -n "$fassistant_id" && "$fassistant_id" != "null" ]]; then
-          features_yaml+="      las:"$'\n'
-          features_yaml+="        image:"$'\n'
-          features_yaml+="          repository: \"${flas_repository}\""$'\n'
-          features_yaml+="          tag: \"${flas_tag}\""$'\n'
-          features_yaml+="        assistantId: \"${fassistant_id}\""$'\n'
+        if [[ "${fname}" == "agentruntime" ]]; then
+          las_network_mode="connected"
+          [[ "${AIRGAP_MODE:-false}" == "true" ]] && las_network_mode="airgapped"
+          las_yaml=$(render_las_feature_yaml "${CONFIG_FILE}" "${i}" "${las_network_mode}")
+          # Command substitution strips trailing newlines from the renderer output.
+          features_yaml+="${las_yaml}"$'\n'
         fi
         [[ -n "$fsa" && "$fsa" != "null" ]] && features_yaml+="      serviceAccountName: ${fsa}"$'\n'
         if [[ -n "$fenv_yaml" && "$fenv_yaml" != "{}" && "$fenv_yaml" != "null" ]]; then

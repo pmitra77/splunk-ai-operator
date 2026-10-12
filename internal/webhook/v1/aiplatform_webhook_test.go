@@ -194,6 +194,7 @@ var _ = Describe("AIPlatform Webhook", func() {
 					{
 						Name:              "agentruntime",
 						Provider:          "mltk",
+						LAS:               fixtureLASForWebhookTest(),
 						LicenseSecretRef:  "las-auth",
 						PostgresSecretRef: "mltk-postgres",
 						RedisSecretRef:    "las-redis",
@@ -201,6 +202,7 @@ var _ = Describe("AIPlatform Webhook", func() {
 					{
 						Name:              "agentruntime",
 						Provider:          "seca",
+						LAS:               fixtureLASForWebhookTest(),
 						LicenseSecretRef:  "las-auth",
 						PostgresSecretRef: "seca-postgres",
 						RedisSecretRef:    "las-redis",
@@ -214,6 +216,7 @@ var _ = Describe("AIPlatform Webhook", func() {
 					{
 						Name:              "agentruntime",
 						Provider:          "mltk",
+						LAS:               fixtureLASForWebhookTest(),
 						LicenseSecretRef:  "las-auth",
 						PostgresSecretRef: "mltk-postgres",
 						RedisSecretRef:    "las-redis",
@@ -221,6 +224,7 @@ var _ = Describe("AIPlatform Webhook", func() {
 					{
 						Name:              "agentruntime",
 						Provider:          "mltk",
+						LAS:               fixtureLASForWebhookTest(),
 						LicenseSecretRef:  "las-auth",
 						PostgresSecretRef: "other-postgres",
 						RedisSecretRef:    "las-redis",

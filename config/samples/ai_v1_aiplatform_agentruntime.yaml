@@ -17,6 +17,25 @@ spec:
           repository: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/las-contract-fixture
           tag: candidate-20261008-0810
         assistantId: contract_fixture
+        networkMode: connected
+        tracing:
+          enabled: true
+          endpoint: https://langsmith.internal.example.com
+        api:
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+        queue:
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+          autoscaling:
+            enabled: true
+            minReplicas: 1
+            maxReplicas: 3
+            targetCPUUtilizationPercentage: 80
       licenseSecretRef: las-auth
       postgresSecretRef: las-postgres
       redisSecretRef: las-redis

@@ -1,0 +1,38 @@
+apiVersion: ai.splunk.com/v1
+kind: AIPlatform
+metadata:
+  name: agentruntime-airgapped-sample
+  namespace: ai-platform
+spec:
+  objectStorage:
+    path: s3://ai-platform-dev
+    region: us-west-2
+  features:
+    - name: agentruntime
+      provider: mltk
+      las:
+        image:
+          repository: registry.internal.example.com/ml-platform/langgraph-agent-server
+          tag: "0.1.0"
+        assistantId: contract_fixture
+        networkMode: airgapped
+        tracing:
+          enabled: false
+        api:
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+        queue:
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+          autoscaling:
+            enabled: true
+            minReplicas: 1
+            maxReplicas: 3
+            targetCPUUtilizationPercentage: 80
+      licenseSecretRef: las-auth
+      postgresSecretRef: las-postgres
+      redisSecretRef: las-redis

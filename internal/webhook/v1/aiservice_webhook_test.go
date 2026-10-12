@@ -167,6 +167,7 @@ var _ = Describe("AIService Webhook", func() {
 						Feature: aiv1.FeatureSpec{
 							Name:              "agentruntime",
 							Provider:          "mltk",
+							LAS:               fixtureLASForWebhookTest(),
 							LicenseSecretRef:  "las-auth",
 							PostgresSecretRef: "las-postgres",
 							RedisSecretRef:    "las-redis",

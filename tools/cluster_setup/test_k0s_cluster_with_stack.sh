@@ -91,6 +91,8 @@ _load_functions() {
   eval "$(_extract_fn validate_image_config)"
   eval "$(_extract_fn configure_images)"
   eval "$(_extract_fn validate_scale_factor_config)"
+  eval "$(_extract_fn yaml_single_quote)"
+  eval "$(_extract_fn render_las_feature_yaml)"
   eval "$(_extract_fn object_store_auth_looks_like_placeholder)"
   eval "$(_extract_fn _pod_is_healthy)"
   eval "$(_extract_fn _classify_pod_failure)"
@@ -99,6 +101,50 @@ _load_functions() {
 }
 
 _load_functions
+
+# ── Tests: LAS AIPlatform rendering allow-list and effective network mode ────
+suite "render_las_feature_yaml"
+echo "▶ render_las_feature_yaml"
+_las_tmpdir=$(mktemp -d)
+cat > "${_las_tmpdir}/config.yaml" <<'YAML'
+aiPlatform:
+  features:
+    - name: agentruntime
+      las:
+        image:
+          repository: registry.example/las
+          tag: v1
+        assistantId: sample
+        tracing:
+          enabled: false
+        queue:
+          resources:
+            requests:
+              cpu: "1"
+          autoscaling:
+            enabled: true
+            minReplicas: 1
+            maxReplicas: 3
+            targetCPUUtilizationPercentage: 80
+        credentials:
+          postgresConnectionUrl: DO_NOT_RENDER_POSTGRES_URL
+          langsmithApiKey: DO_NOT_RENDER_LANGSMITH_KEY
+YAML
+_las_rendered=$(render_las_feature_yaml "${_las_tmpdir}/config.yaml" 0 airgapped)
+assert_eq "effective air-gapped mode is rendered" "1" "$(grep -c 'networkMode: airgapped' <<<"${_las_rendered}" || true)"
+assert_eq "queue CPU and autoscaling settings are rendered" "1" "$(grep -c 'targetCPUUtilizationPercentage: 80' <<<"${_las_rendered}" || true)"
+assert_eq "raw PostgreSQL credential is excluded" "0" "$(grep -c 'DO_NOT_RENDER_POSTGRES_URL' <<<"${_las_rendered}" || true)"
+assert_eq "raw LangSmith key is excluded" "0" "$(grep -c 'DO_NOT_RENDER_LANGSMITH_KEY' <<<"${_las_rendered}" || true)"
+{
+  printf 'spec:\n  features:\n    - name: agentruntime\n'
+  # Match the installer concatenation: command substitution strips the renderer's
+  # final newline, so the caller must restore it before a following feature field.
+  printf '%s' "${_las_rendered}"$'\n'
+  printf '      serviceAccountName: fixture-sa\n'
+} > "${_las_tmpdir}/rendered.yaml"
+assert_eq "rendered LAS feature is valid YAML" "airgapped" "$(yq eval -r '.spec.features[0].las.networkMode' "${_las_tmpdir}/rendered.yaml")"
+assert_eq "following feature field remains valid YAML" "fixture-sa" "$(yq eval -r '.spec.features[0].serviceAccountName' "${_las_tmpdir}/rendered.yaml")"
+rm -rf "${_las_tmpdir}"
 
 # ── Tests: build_image_url ─────────────────────────────────────────────────────
 

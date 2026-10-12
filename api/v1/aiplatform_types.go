@@ -228,7 +228,7 @@ type FeatureSpec struct {
 	Env map[string]string `json:"env,omitempty"`
 }
 
-// LASFeatureSpec contains the deployable Agent Server artifact identity.
+// LASFeatureSpec contains the deployable Agent Server configuration.
 type LASFeatureSpec struct {
 	// Image is the Agent Server image used by both API and queue workloads.
 	Image LASImageSpec `json:"image"`
@@ -238,9 +238,29 @@ type LASFeatureSpec struct {
 	// API contains the typed API workload settings. Its replica count remains fixed at one.
 	// +kubebuilder:validation:Optional
 	API LASWorkloadSpec `json:"api,omitempty"`
-	// Queue contains the typed queue workload settings.
+	// NetworkMode is the effective network mode for the cluster. Older resources
+	// default to connected mode when this field is omitted.
+	// +kubebuilder:validation:Enum=connected;airgapped
+	// +kubebuilder:default=connected
+	NetworkMode string `json:"networkMode,omitempty"`
+	// Tracing configures tracing to an internal LangSmith endpoint. Credentials
+	// are supplied through Kubernetes Secrets, never stored in this resource.
 	// +kubebuilder:validation:Optional
-	Queue LASWorkloadSpec `json:"queue,omitempty"`
+	Tracing *LASTracingSpec `json:"tracing,omitempty"`
+	// Queue configures the LAS queue workload and its optional CPU-based autoscaler.
+	// +kubebuilder:validation:Optional
+	Queue *LASQueueSpec `json:"queue,omitempty"`
+}
+
+// LASTracingSpec configures tracing to an internal LangSmith endpoint.
+type LASTracingSpec struct {
+	// Enabled controls whether LAS sends tracing data.
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+	// Endpoint is required when tracing is enabled.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinLength=1
+	Endpoint string `json:"endpoint,omitempty"`
 }
 
 // LASWorkloadSpec contains settings shared by one LAS workload. It intentionally
@@ -261,6 +281,36 @@ type LASWorkloadSpec struct {
 	LivenessProbe *corev1.Probe `json:"livenessProbe,omitempty"`
 	// SchedulingSpec applies Kubernetes node selection, tolerations and affinity.
 	SchedulingSpec `json:",inline"`
+}
+
+// LASQueueSpec configures the queue workload and horizontal autoscaling.
+type LASQueueSpec struct {
+	LASWorkloadSpec `json:",inline"`
+	// Autoscaling controls the queue HorizontalPodAutoscaler. It is optional to
+	// preserve the AIP-5391 behavior, where queue autoscaling was not configured.
+	// +kubebuilder:validation:Optional
+	Autoscaling *LASQueueAutoscalingSpec `json:"autoscaling,omitempty"`
+}
+
+// LASQueueAutoscalingSpec defines bounds and the CPU utilization target.
+type LASQueueAutoscalingSpec struct {
+	// Enabled controls whether the queue HPA is created. Defaults to false to
+	// preserve the AIP-5391 chart behavior unless autoscaling is explicitly enabled.
+	// +kubebuilder:default=false
+	Enabled *bool `json:"enabled,omitempty"`
+	// MinReplicas is the minimum number of queue Pods. Defaults to 1.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	MinReplicas *int32 `json:"minReplicas,omitempty"`
+	// MaxReplicas is the maximum number of queue Pods. Defaults to 3.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=3
+	MaxReplicas *int32 `json:"maxReplicas,omitempty"`
+	// TargetCPUUtilizationPercentage is the HPA CPU target. Defaults to 80.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	// +kubebuilder:default=80
+	TargetCPUUtilizationPercentage *int32 `json:"targetCPUUtilizationPercentage,omitempty"`
 }
 
 // LASImageSpec identifies a selectable Agent Server image.

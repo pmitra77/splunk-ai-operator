@@ -196,6 +196,10 @@ func lasReleaseName(serviceName string) string {
 }
 
 func lasValues(ai *aiv1.AIService) map[string]interface{} {
+	queue := ai.Spec.Feature.LAS.Queue
+	if queue == nil {
+		queue = &aiv1.LASQueueSpec{}
+	}
 	values := map[string]interface{}{
 		"fullnameOverride": lasReleaseName(ai.Name) + "-langgraph-cloud",
 		"images": map[string]interface{}{"apiServerImage": map[string]interface{}{
@@ -206,11 +210,12 @@ func lasValues(ai *aiv1.AIService) map[string]interface{} {
 			"enabled": true,
 			"deployment": map[string]interface{}{
 				"strategy":       lasRolloutStrategyValues(),
-				"resources":      lasWorkloadResources(ai.Spec.Feature.LAS.Queue, "1"),
-				"startupProbe":   lasProbeValues(ai.Spec.Feature.LAS.Queue.StartupProbe, false),
-				"readinessProbe": lasProbeValues(ai.Spec.Feature.LAS.Queue.ReadinessProbe, false),
-				"livenessProbe":  lasProbeValues(ai.Spec.Feature.LAS.Queue.LivenessProbe, false),
+				"resources":      lasWorkloadResources(queue.LASWorkloadSpec, "1"),
+				"startupProbe":   lasProbeValues(queue.StartupProbe, false),
+				"readinessProbe": lasProbeValues(queue.ReadinessProbe, false),
+				"livenessProbe":  lasProbeValues(queue.LivenessProbe, false),
 			},
+			"autoscaling": lasQueueAutoscalingValues(queue.Autoscaling),
 		},
 		"apiServer": map[string]interface{}{
 			"autoscaling": map[string]interface{}{"enabled": false},
@@ -232,10 +237,11 @@ func lasValues(ai *aiv1.AIService) map[string]interface{} {
 		}},
 		"mongo": map[string]interface{}{"enabled": false},
 	}
+	applyLASTracing(values, ai.Spec.Feature.LAS.Tracing)
 	apiDeployment := values["apiServer"].(map[string]interface{})["deployment"].(map[string]interface{})
 	applyLASWorkloadScheduling(apiDeployment, ai.Spec.Feature.LAS.API)
 	queueDeployment := values["queue"].(map[string]interface{})["deployment"].(map[string]interface{})
-	applyLASWorkloadScheduling(queueDeployment, ai.Spec.Feature.LAS.Queue)
+	applyLASWorkloadScheduling(queueDeployment, queue.LASWorkloadSpec)
 	if len(ai.Spec.ImagePullSecrets) > 0 {
 		refs := make([]map[string]string, 0, len(ai.Spec.ImagePullSecrets))
 		for _, ref := range ai.Spec.ImagePullSecrets {
@@ -253,6 +259,42 @@ func lasRolloutStrategyValues() map[string]interface{} {
 			"maxSurge":       0,
 			"maxUnavailable": 1,
 		},
+	}
+}
+
+func lasQueueAutoscalingValues(autoscaling *aiv1.LASQueueAutoscalingSpec) map[string]interface{} {
+	values := map[string]interface{}{"enabled": false, "minReplicas": int32(1), "maxReplicas": int32(3), "targetCPUUtilizationPercentage": int32(80)}
+	if autoscaling == nil {
+		return values
+	}
+	if autoscaling.Enabled != nil {
+		values["enabled"] = *autoscaling.Enabled
+	}
+	if autoscaling.MinReplicas != nil {
+		values["minReplicas"] = *autoscaling.MinReplicas
+	}
+	if autoscaling.MaxReplicas != nil {
+		values["maxReplicas"] = *autoscaling.MaxReplicas
+	}
+	if autoscaling.TargetCPUUtilizationPercentage != nil {
+		values["targetCPUUtilizationPercentage"] = *autoscaling.TargetCPUUtilizationPercentage
+	}
+	return values
+}
+
+func applyLASTracing(values map[string]interface{}, tracing *aiv1.LASTracingSpec) {
+	if tracing == nil {
+		return
+	}
+	extraEnv := []map[string]interface{}{
+		{"name": "LANGSMITH_TRACING", "value": fmt.Sprintf("%t", tracing.Enabled)},
+	}
+	if tracing.Enabled && tracing.Endpoint != "" {
+		extraEnv = append(extraEnv, map[string]interface{}{"name": "LANGSMITH_ENDPOINT", "value": tracing.Endpoint})
+	}
+	for _, workload := range []string{"apiServer", "queue"} {
+		deployment := values[workload].(map[string]interface{})["deployment"].(map[string]interface{})
+		deployment["extraEnv"] = extraEnv
 	}
 }
 

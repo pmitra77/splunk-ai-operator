@@ -107,6 +107,7 @@ func TestLASValuesSelectImageAndKeepRunContextOut(t *testing.T) {
 		LAS: &aiv1.LASFeatureSpec{
 			Image:       aiv1.LASImageSpec{Repository: "registry.example/fixture", Tag: "candidate-123"},
 			AssistantID: "contract_fixture",
+			Queue:       &aiv1.LASQueueSpec{Autoscaling: &aiv1.LASQueueAutoscalingSpec{}},
 		},
 	}
 	values := lasValues(ai)
@@ -138,6 +139,93 @@ func TestLASValuesSelectImageAndKeepRunContextOut(t *testing.T) {
 		if bytes.Contains(serialized, []byte(forbidden)) {
 			t.Errorf("Helm values contain per-invocation field %q", forbidden)
 		}
+	}
+}
+
+func TestLASTracingSettingsReachAPIAndQueueWorkloads(t *testing.T) {
+	ai := &aiv1.AIService{}
+	ai.Name = "fixture"
+	ai.Spec.Feature = aiv1.FeatureSpec{
+		LicenseSecretRef:  "las-credentials",
+		PostgresSecretRef: "fixture-postgres",
+		RedisSecretRef:    "fixture-redis",
+		LAS: &aiv1.LASFeatureSpec{
+			Image:       aiv1.LASImageSpec{Repository: "registry.example/fixture", Tag: "candidate-123"},
+			AssistantID: "contract_fixture",
+			Tracing:     &aiv1.LASTracingSpec{Enabled: false},
+		},
+	}
+	disabledValues := lasValues(ai)
+	ai.Spec.Feature.LAS.Tracing.Enabled = true
+	ai.Spec.Feature.LAS.Tracing.Endpoint = "https://langsmith.internal"
+	values := lasValues(ai)
+	if sameValues(disabledValues, values) {
+		t.Fatal("changing tracing settings must change the Helm values and trigger an upgrade")
+	}
+	for _, name := range []string{"apiServer", "queue"} {
+		deployment := values[name].(map[string]interface{})["deployment"].(map[string]interface{})
+		env := deployment["extraEnv"].([]map[string]interface{})
+		if len(env) != 2 || env[0]["name"] != "LANGSMITH_TRACING" || env[0]["value"] != "true" || env[1]["name"] != "LANGSMITH_ENDPOINT" || env[1]["value"] != "https://langsmith.internal" {
+			t.Fatalf("%s tracing env = %#v", name, env)
+		}
+	}
+	if !sameValues(values, lasValues(ai)) {
+		t.Fatal("tracing values must be stable for Helm release comparison")
+	}
+
+	chart, err := loader.LoadArchive(bytes.NewReader(lasChartArchive))
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderValues, err := chartutil.ToRenderValues(chart, values, chartutil.ReleaseOptions{Name: "las-fixture", Namespace: "default"}, chartutil.DefaultCapabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := engine.Render(chart, renderValues)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, template := range []string{
+		"langgraph-cloud/templates/api-server/deployment.yaml",
+		"langgraph-cloud/templates/queue/deployment.yaml",
+	} {
+		manifest := rendered[template]
+		if !strings.Contains(manifest, "name: LANGSMITH_TRACING\n              value: \"true\"") || !strings.Contains(manifest, "name: LANGSMITH_ENDPOINT\n              value: https://langsmith.internal") {
+			t.Errorf("%s does not render tracing configuration", template)
+		}
+		if !strings.Contains(manifest, "name: LANGSMITH_API_KEY\n              valueFrom:") {
+			t.Errorf("%s does not source the LangSmith credential from the existing Secret", template)
+		}
+	}
+}
+
+func TestLASQueueAutoscalingValuesUseDefaultsAndOverrides(t *testing.T) {
+	defaults := lasQueueAutoscalingValues(nil)
+	if defaults["enabled"] != false || defaults["minReplicas"] != int32(1) || defaults["maxReplicas"] != int32(3) || defaults["targetCPUUtilizationPercentage"] != int32(80) {
+		t.Fatalf("unexpected queue autoscaling defaults: %#v", defaults)
+	}
+	enabled := false
+	minReplicas, maxReplicas, targetCPU := int32(2), int32(6), int32(65)
+	configured := lasQueueAutoscalingValues(&aiv1.LASQueueAutoscalingSpec{
+		Enabled: &enabled, MinReplicas: &minReplicas, MaxReplicas: &maxReplicas,
+		TargetCPUUtilizationPercentage: &targetCPU,
+	})
+	if configured["enabled"] != false || configured["minReplicas"] != minReplicas || configured["maxReplicas"] != maxReplicas || configured["targetCPUUtilizationPercentage"] != targetCPU {
+		t.Fatalf("queue autoscaling overrides were not mapped: %#v", configured)
+	}
+}
+
+func TestAIP5391QueueConfigKeepsHPAOptIn(t *testing.T) {
+	ai := &aiv1.AIService{}
+	ai.Spec.Feature.LAS = &aiv1.LASFeatureSpec{
+		Image:       aiv1.LASImageSpec{Repository: "registry.example/fixture", Tag: "candidate-123"},
+		AssistantID: "contract_fixture",
+		Queue:       &aiv1.LASQueueSpec{LASWorkloadSpec: aiv1.LASWorkloadSpec{}},
+	}
+	values := lasValues(ai)
+	queue := values["queue"].(map[string]interface{})
+	if queue["autoscaling"].(map[string]interface{})["enabled"] != false {
+		t.Fatal("AIP-5391 queue configuration without autoscaling must not create an HPA")
 	}
 }
 
@@ -213,16 +301,19 @@ func TestLASChartMapsWorkloadDefaultsOverridesSchedulingAndReferences(t *testing
 					TimeoutSeconds: 7,
 				},
 			},
-			Queue: aiv1.LASWorkloadSpec{
-				SchedulingSpec: aiv1.SchedulingSpec{
-					NodeSelector: map[string]string{"node-role": "queue"},
-					Tolerations:  []corev1.Toleration{{Key: "las", Operator: corev1.TolerationOpEqual, Value: "queue", Effect: corev1.TaintEffectNoSchedule}},
-					Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
-						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
-							NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "kubernetes.io/os", Operator: corev1.NodeSelectorOpIn, Values: []string{"linux"}}}}},
-						},
-					}},
+			Queue: &aiv1.LASQueueSpec{
+				LASWorkloadSpec: aiv1.LASWorkloadSpec{
+					SchedulingSpec: aiv1.SchedulingSpec{
+						NodeSelector: map[string]string{"node-role": "queue"},
+						Tolerations:  []corev1.Toleration{{Key: "las", Operator: corev1.TolerationOpEqual, Value: "queue", Effect: corev1.TaintEffectNoSchedule}},
+						Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+								NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "kubernetes.io/os", Operator: corev1.NodeSelectorOpIn, Values: []string{"linux"}}}}},
+							},
+						}},
+					},
 				},
+				Autoscaling: &aiv1.LASQueueAutoscalingSpec{},
 			},
 		},
 	}

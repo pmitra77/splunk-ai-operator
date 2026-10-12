@@ -19,6 +19,7 @@ package v1
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 
@@ -572,7 +573,7 @@ func (v *AIPlatformCustomValidator) validateFeatures(features []aiv1.FeatureSpec
 
 func validateLASFeature(las *aiv1.LASFeatureSpec, fldPath *field.Path) field.ErrorList {
 	if las == nil {
-		return field.ErrorList{field.Required(fldPath, "las image and assistantId must be specified for agentruntime")}
+		return field.ErrorList{field.Required(fldPath, "LAS configuration must be specified for agentruntime")}
 	}
 	var errs field.ErrorList
 	for _, item := range []struct{ name, value string }{
@@ -583,6 +584,60 @@ func validateLASFeature(las *aiv1.LASFeatureSpec, fldPath *field.Path) field.Err
 		if strings.TrimSpace(item.value) == "" {
 			parts := strings.Split(item.name, ".")
 			errs = append(errs, field.Required(fldPath.Child(parts[0], parts[1:]...), item.name+" must be specified"))
+		}
+	}
+	if las.NetworkMode != "" && las.NetworkMode != "connected" && las.NetworkMode != "airgapped" {
+		errs = append(errs, field.NotSupported(fldPath.Child("networkMode"), las.NetworkMode, []string{"connected", "airgapped"}))
+	}
+	if las.Tracing != nil && las.Tracing.Enabled {
+		endpoint := strings.TrimSpace(las.Tracing.Endpoint)
+		if endpoint == "" {
+			errs = append(errs, field.Required(fldPath.Child("tracing", "endpoint"), "endpoint must be specified when tracing is enabled"))
+		} else if parsed, err := url.ParseRequestURI(endpoint); err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			errs = append(errs, field.Invalid(fldPath.Child("tracing", "endpoint"), endpoint, "must be an absolute URL with a scheme and host"))
+		}
+	}
+	if las.Queue == nil {
+		return errs
+	}
+	as := las.Queue.Autoscaling
+	if as == nil {
+		return errs
+	}
+	minReplicas := int32(1)
+	if as.MinReplicas != nil {
+		minReplicas = *as.MinReplicas
+		if minReplicas < 1 {
+			errs = append(errs, field.Invalid(fldPath.Child("queue", "autoscaling", "minReplicas"), minReplicas, "must be at least 1"))
+		}
+	}
+	maxReplicas := int32(3)
+	if as.MaxReplicas != nil {
+		maxReplicas = *as.MaxReplicas
+		if maxReplicas < 1 {
+			errs = append(errs, field.Invalid(fldPath.Child("queue", "autoscaling", "maxReplicas"), maxReplicas, "must be at least 1"))
+		}
+	}
+	if maxReplicas < minReplicas {
+		errs = append(errs, field.Invalid(fldPath.Child("queue", "autoscaling", "maxReplicas"), maxReplicas, "must be greater than or equal to minReplicas"))
+	}
+	targetCPU := int32(80)
+	if as.TargetCPUUtilizationPercentage != nil {
+		targetCPU = *as.TargetCPUUtilizationPercentage
+	}
+	if targetCPU < 1 || targetCPU > 100 {
+		errs = append(errs, field.Invalid(fldPath.Child("queue", "autoscaling", "targetCPUUtilizationPercentage"), targetCPU, "must be between 1 and 100"))
+	}
+	enabled := false
+	if as.Enabled != nil {
+		enabled = *as.Enabled
+	}
+	if enabled {
+		cpuRequest, found := las.Queue.Resources.Requests["cpu"]
+		if !found {
+			errs = append(errs, field.Required(fldPath.Child("queue", "resources", "requests", "cpu"), "a positive CPU request is required when queue autoscaling is enabled"))
+		} else if cpuRequest.Sign() <= 0 {
+			errs = append(errs, field.Invalid(fldPath.Child("queue", "resources", "requests", "cpu"), cpuRequest.String(), "must be positive when queue autoscaling is enabled"))
 		}
 	}
 	return errs

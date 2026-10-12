@@ -2581,8 +2581,18 @@ spec:
                         - repository
                         - tag
                         type: object
+                      networkMode:
+                        default: connected
+                        description: |-
+                          NetworkMode is the effective network mode for the cluster. Older resources
+                          default to connected mode when this field is omitted.
+                        enum:
+                        - connected
+                        - airgapped
+                        type: string
                       queue:
-                        description: Queue contains the typed queue workload settings.
+                        description: Queue configures the LAS queue workload and its
+                          optional CPU-based autoscaler.
                         properties:
                           affinity:
                             description: Affinity defines pod affinity and anti-affinity
@@ -3513,6 +3523,40 @@ spec:
                                     x-kubernetes-list-type: atomic
                                 type: object
                             type: object
+                          autoscaling:
+                            description: |-
+                              Autoscaling controls the queue HorizontalPodAutoscaler. It is optional to
+                              preserve the AIP-5391 behavior, where queue autoscaling was not configured.
+                            properties:
+                              enabled:
+                                default: false
+                                description: |-
+                                  Enabled controls whether the queue HPA is created. Defaults to false to
+                                  preserve the AIP-5391 chart behavior unless autoscaling is explicitly enabled.
+                                type: boolean
+                              maxReplicas:
+                                default: 3
+                                description: MaxReplicas is the maximum number of
+                                  queue Pods. Defaults to 3.
+                                format: int32
+                                minimum: 1
+                                type: integer
+                              minReplicas:
+                                default: 1
+                                description: MinReplicas is the minimum number of
+                                  queue Pods. Defaults to 1.
+                                format: int32
+                                minimum: 1
+                                type: integer
+                              targetCPUUtilizationPercentage:
+                                default: 80
+                                description: TargetCPUUtilizationPercentage is the
+                                  HPA CPU target. Defaults to 80.
+                                format: int32
+                                maximum: 100
+                                minimum: 1
+                                type: integer
+                            type: object
                           livenessProbe:
                             description: LivenessProbe overrides the workload liveness
                               health check.
@@ -4085,6 +4129,21 @@ spec:
                                   type: string
                               type: object
                             type: array
+                        type: object
+                      tracing:
+                        description: |-
+                          Tracing configures tracing to an internal LangSmith endpoint. Credentials
+                          are supplied through Kubernetes Secrets, never stored in this resource.
+                        properties:
+                          enabled:
+                            default: false
+                            description: Enabled controls whether LAS sends tracing
+                              data.
+                            type: boolean
+                          endpoint:
+                            description: Endpoint is required when tracing is enabled.
+                            minLength: 1
+                            type: string
                         type: object
                     required:
                     - assistantId

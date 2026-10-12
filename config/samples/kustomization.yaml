@@ -2,5 +2,6 @@
 resources:
 - ai_v1_aiplatform.yaml
 - ai_v1_aiplatform_agentruntime.yaml
+- ai_v1_aiplatform_agentruntime_airgapped.yaml
 - ai_v1_aiservice.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

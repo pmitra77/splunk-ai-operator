@@ -31,11 +31,14 @@ import (
 )
 
 const (
-	lasChartVersion                   = "0.3.5-splunk.1"
-	lasChartSHA256                    = "ef80afdef0c44a232946e67dc84521bed4e2b3a0234643eafc2ec811b6b092c8"
-	lasOwnerLabel                     = "ai.splunk.com/aiservice-uid"
-	defaultAgentRuntimeHTTPPort int32 = 8080
+	lasChartVersion                       = "0.3.5-splunk.1"
+	lasChartSHA256                        = "ef80afdef0c44a232946e67dc84521bed4e2b3a0234643eafc2ec811b6b092c8"
+	lasOwnerLabel                         = "ai.splunk.com/aiservice-uid"
+	lasCredentialRevisionAnnotation       = "ai.splunk.com/las-credential-revision"
+	defaultAgentRuntimeHTTPPort     int32 = 8080
 )
+
+var errLASCredentialRevisionMismatch = errors.New("LAS credential revision is not applied to the Pod template")
 
 //go:embed chart/langgraph-cloud-0.3.5-splunk.1.tgz
 var lasChartArchive []byte
@@ -51,7 +54,8 @@ func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error
 	if ai.Spec.Feature.LAS == nil || ai.Spec.Feature.LAS.Image.Repository == "" || ai.Spec.Feature.LAS.Image.Tag == "" || ai.Spec.Feature.LAS.AssistantID == "" {
 		return r.fail(ctx, ai, "ConfigurationInvalid", errors.New("agentruntime requires las.image.repository, las.image.tag, and las.assistantId"))
 	}
-	if err := r.checkSecrets(ctx, ai); err != nil {
+	credentialRevision, err := r.credentialRevision(ctx, ai)
+	if err != nil {
 		return r.fail(ctx, ai, "DependenciesUnavailable", err)
 	}
 	chartDigest := sha256.Sum256(lasChartArchive)
@@ -67,7 +71,7 @@ func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error
 		return r.fail(ctx, ai, "HelmConfigurationFailed", err)
 	}
 	name := lasReleaseName(ai.Name)
-	values := lasValues(ai)
+	values := lasValues(ai, credentialRevision)
 	current, err := action.NewStatus(config).Run(name)
 	if err != nil && !errors.Is(err, driver.ErrReleaseNotFound) {
 		return r.fail(ctx, ai, "HelmStatusFailed", err)
@@ -101,8 +105,10 @@ func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error
 	} else {
 		needsUpgrade := !sameValues(current.Config, values) || current.Chart.Metadata.Version != lasChartVersion || current.Info.Status != release.StatusDeployed
 		if !needsUpgrade {
-			if err := r.checkDeployments(ctx, ai, name); apierrors.IsNotFound(err) {
+			if err := r.checkDeployments(ctx, ai, name, credentialRevision); apierrors.IsNotFound(err) || errors.Is(err, errLASCredentialRevisionMismatch) {
 				needsUpgrade = true
+			} else if err != nil {
+				return r.fail(ctx, ai, "WorkloadsNotReady", err)
 			}
 		}
 		if needsUpgrade {
@@ -124,7 +130,7 @@ func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error
 		}
 	}
 
-	if err := r.checkDeployments(ctx, ai, name); err != nil {
+	if err := r.checkDeployments(ctx, ai, name, credentialRevision); err != nil {
 		return r.fail(ctx, ai, "WorkloadsNotReady", err)
 	}
 	if err := r.ensureStableService(ctx, ai, name); err != nil {
@@ -195,7 +201,11 @@ func lasReleaseName(serviceName string) string {
 	return name[:25] + "-" + hex.EncodeToString(digest[:4])
 }
 
-func lasValues(ai *aiv1.AIService) map[string]interface{} {
+func lasValues(ai *aiv1.AIService, credentialRevisions ...string) map[string]interface{} {
+	credentialRevision := ""
+	if len(credentialRevisions) > 0 {
+		credentialRevision = credentialRevisions[0]
+	}
 	queue := ai.Spec.Feature.LAS.Queue
 	if queue == nil {
 		queue = &aiv1.LASQueueSpec{}
@@ -239,8 +249,10 @@ func lasValues(ai *aiv1.AIService) map[string]interface{} {
 	}
 	applyLASTracing(values, ai.Spec.Feature.LAS.Tracing)
 	apiDeployment := values["apiServer"].(map[string]interface{})["deployment"].(map[string]interface{})
+	apiDeployment["annotations"] = map[string]string{lasCredentialRevisionAnnotation: credentialRevision}
 	applyLASWorkloadScheduling(apiDeployment, ai.Spec.Feature.LAS.API)
 	queueDeployment := values["queue"].(map[string]interface{})["deployment"].(map[string]interface{})
+	queueDeployment["annotations"] = map[string]string{lasCredentialRevisionAnnotation: credentialRevision}
 	applyLASWorkloadScheduling(queueDeployment, queue.LASWorkloadSpec)
 	if len(ai.Spec.ImagePullSecrets) > 0 {
 		refs := make([]map[string]string, 0, len(ai.Spec.ImagePullSecrets))
@@ -398,27 +410,40 @@ func sameValues(a, b map[string]interface{}) bool {
 	return errA == nil && errB == nil && bytes.Equal(left, right)
 }
 
-func (r *LASReconciler) checkSecrets(ctx context.Context, ai *aiv1.AIService) error {
-	for _, ref := range []struct{ name, key string }{
-		{ai.Spec.Feature.LicenseSecretRef, "langgraph_cloud_license_key"},
-		{ai.Spec.Feature.PostgresSecretRef, "postgres_connection_url"},
-		{ai.Spec.Feature.RedisSecretRef, "redis_connection_url"},
-	} {
+func (r *LASReconciler) credentialRevision(ctx context.Context, ai *aiv1.AIService) (string, error) {
+	refs := []struct{ role, name, key string }{
+		{"auth", ai.Spec.Feature.LicenseSecretRef, "langgraph_cloud_license_key"},
+		{"postgres", ai.Spec.Feature.PostgresSecretRef, "postgres_connection_url"},
+		{"redis", ai.Spec.Feature.RedisSecretRef, "redis_connection_url"},
+	}
+	type secretRevision struct {
+		Role            string `json:"role"`
+		UID             string `json:"uid"`
+		ResourceVersion string `json:"resourceVersion"`
+	}
+	revisions := make([]secretRevision, 0, len(refs))
+	for _, ref := range refs {
 		if ref.name == "" {
-			return fmt.Errorf("LAS Secret reference for key %s is empty", ref.key)
+			return "", fmt.Errorf("LAS Secret reference for key %s is empty", ref.key)
 		}
 		secret := &corev1.Secret{}
 		if err := r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: ref.name}, secret); err != nil {
-			return fmt.Errorf("LAS Secret %q unavailable: %w", ref.name, err)
+			return "", fmt.Errorf("LAS Secret %q unavailable: %w", ref.name, err)
 		}
 		if len(secret.Data[ref.key]) == 0 {
-			return fmt.Errorf("LAS Secret %q is missing nonempty key %q", ref.name, ref.key)
+			return "", fmt.Errorf("LAS Secret %q is missing nonempty key %q", ref.name, ref.key)
 		}
+		revisions = append(revisions, secretRevision{Role: ref.role, UID: string(secret.UID), ResourceVersion: secret.ResourceVersion})
 	}
-	return nil
+	canonical, err := json.Marshal(revisions)
+	if err != nil {
+		return "", fmt.Errorf("marshal LAS credential revision metadata: %w", err)
+	}
+	digest := sha256.Sum256(canonical)
+	return hex.EncodeToString(digest[:]), nil
 }
 
-func (r *LASReconciler) checkDeployments(ctx context.Context, ai *aiv1.AIService, name string) error {
+func (r *LASReconciler) checkDeployments(ctx context.Context, ai *aiv1.AIService, name, credentialRevision string) error {
 	for _, suffix := range []string{"-langgraph-cloud-api-server", "-langgraph-cloud-queue"} {
 		deployment := &appsv1.Deployment{}
 		deploymentName := name + suffix
@@ -427,6 +452,9 @@ func (r *LASReconciler) checkDeployments(ctx context.Context, ai *aiv1.AIService
 		}
 		if deployment.Spec.Replicas == nil || deployment.Status.ObservedGeneration < deployment.Generation || deployment.Status.ReadyReplicas < *deployment.Spec.Replicas {
 			return fmt.Errorf("LAS Deployment %s is not ready", deploymentName)
+		}
+		if deployment.Spec.Template.Annotations[lasCredentialRevisionAnnotation] != credentialRevision {
+			return fmt.Errorf("%w: LAS Deployment %s", errLASCredentialRevisionMismatch, deploymentName)
 		}
 	}
 	return nil

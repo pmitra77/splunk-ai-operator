@@ -1,0 +1,9 @@
+# LAS Helm action recovery
+
+The AIService controller waits for up to five minutes for each Helm install, upgrade, rollback, or uninstall. It gives a pending release one additional minute before treating the action as interrupted. During that interval, `Ready=Unknown` reports the pending revision and the controller starts no second Helm action.
+
+After the interval, the controller rereads the release and checks its AIService UID. An interrupted install or uninstall is completed through Helm uninstall. For an interrupted upgrade or rollback, it inspects Helm history and rolls back to the latest deployed revision owned by the same AIService. It checks the resulting release before reporting recovery. The recovered previous revision is **not** the requested configuration: `Ready=False` remains until a later reconcile applies and verifies the current chart, values, credential revision, and workloads.
+
+If the pending revision has no action timestamp, no owned deployed revision exists for rollback, ownership differs, or a recovery action fails, the controller leaves the release and finalizer in place and reports the failure in the AIService `Ready` condition and event. Do not delete Helm storage Secrets or remove the finalizer to clear the condition. Inspect the named release and its history, resolve the underlying Helm or dependency failure, and let reconciliation retry. Reapply the deployment configuration after correcting a missing or invalid credential Secret.
+
+AIService deletion runs before credential validation. It uninstalls only the UID-owned LAS release, removes only the AIService-owned compatibility Service, and retries until cleanup succeeds. An absent release is safe to delete repeatedly. Deployment-managed credential Secrets, PostgreSQL and Redis services, and their data remain in place.

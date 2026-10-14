@@ -7,7 +7,7 @@ staging_dir="$(mktemp -d)"
 trap 'rm -rf "$staging_dir"' EXIT
 
 tar -xzf "$chart_dir/langgraph-cloud-0.3.4.tgz" -C "$staging_dir"
-patch -p1 -d "$staging_dir" < "$chart_dir/rollout-policy.patch"
+git -C "$staging_dir" apply -p1 "$chart_dir/rollout-policy.patch"
 
 # Helm preserves source mtimes in the archive. Normalize them for a stable digest.
 python3 - "$staging_dir/langgraph-cloud" <<'PY'

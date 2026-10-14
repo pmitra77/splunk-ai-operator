@@ -4,7 +4,7 @@ The LAS API and queue Deployments use `RollingUpdate` with `maxSurge: 0` and `ma
 
 The policy lets a one-replica API or queue go briefly unavailable while its old Pod terminates and a replacement becomes ready. The current chart gives each Pod a 30-second termination grace period. That interval allows normal termination but does not prove active runs finish. A queued job should remain claimable after replacement; an active job may complete, retry from a checkpoint, or fail according to the selected Agent Server runtime and graph behavior. Capture the run ID and its final state during qualification. Product actions that could repeat need their own idempotency policy. Zero downtime and exactly-once execution are not guaranteed.
 
-Queue HPA scale-down can also terminate an active worker. The ERD requires a 300-second scale-down stabilization window and removal of at most one worker per 60 seconds; those HPA controls do not drain an active run. Their chart implementation and scale-down tests are tracked separately in AIP-5394/AIP-5406/AIP-5411.
+Queue HPA scale-down can also terminate an active worker. The packaged chart applies the ERD's 300-second scale-down stabilization window and removes at most one worker per 60 seconds. Those HPA controls do not drain an active run. Active-run recovery remains a separate qualification requirement tracked in AIP-5406/AIP-5411.
 
 ## Capacity floor
 

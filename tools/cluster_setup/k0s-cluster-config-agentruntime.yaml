@@ -43,7 +43,7 @@ images:
   registry: ""
   registryInsecure: false
   operator:
-    image: "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/splunk-ai-operator:agentruntime-ai-tier-2fbd9ef-stable-spec-202608171633"
+    image: "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/splunk-ai-operator:aip-5394-20261013171018"
   ray:
     headImage: "docker.io/rayproject/ray:2.44.0"
     workerImage: "docker.io/rayproject/ray:2.44.0"
@@ -109,9 +109,9 @@ aiPlatform:
       redisSecretRef: "las-redis"
       las:
         image:
-          repository: "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/las-contract-fixture"
-          tag: "candidate-20261008-0810"
-        assistantId: "contract_fixture"
+          repository: "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/las-sample-agent"
+          tag: "las-poc-20260930-115209"
+        assistantId: "echo"
         tracing:
           enabled: false
         api:

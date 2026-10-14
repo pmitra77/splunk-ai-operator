@@ -181,7 +181,7 @@ func TestLASCredentialRevisionChangesWhenSecretIsRecreatedWithSameName(t *testin
 	require.NotEqual(t, before, after, "replacing a Secret under the same name must change the revision through its UID")
 }
 
-func TestLASReconcileAfterRestartDoesNotUpgradeUnchangedCredentialRevision(t *testing.T) {
+func TestLASCredentialRevisionRemainsStableAfterControllerRestart(t *testing.T) {
 	ai, secrets := lasRotationFixture()
 	scheme := buildAgentRuntimeTestScheme(t)
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lasRotationObjects(ai, secrets)...).Build()
@@ -201,7 +201,7 @@ func TestLASReconcileAfterRestartDoesNotUpgradeUnchangedCredentialRevision(t *te
 	require.Equal(t, 1, current.Version, "restart and repeated reconcile with unchanged Secret versions must not create a Helm revision")
 }
 
-func TestLASInvalidSecretDoesNotChangeExistingReleaseOrWorkloads(t *testing.T) {
+func TestLASInvalidSecretDoesNotUpgradeExistingRelease(t *testing.T) {
 	helm := &fakeLASHelmActions{current: testLASRelease("las-fixture", "service-uid", release.StatusDeployed, 1, time.Now())}
 	reconciler, ai := testLASReconciler(t, helm, true)
 	secret := &corev1.Secret{}

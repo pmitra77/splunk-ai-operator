@@ -31,8 +31,8 @@ import (
 )
 
 const (
-	lasChartVersion                       = "0.3.5-splunk.1"
-	lasChartSHA256                        = "ef80afdef0c44a232946e67dc84521bed4e2b3a0234643eafc2ec811b6b092c8"
+	lasChartVersion                       = "0.3.5-splunk.2"
+	lasChartSHA256                        = "4fa2580f6e38254f399cc23e230f314dfdf42566f71df41ff1e4b23d36426058"
 	lasOwnerLabel                         = "ai.splunk.com/aiservice-uid"
 	lasCredentialRevisionAnnotation       = "ai.splunk.com/las-credential-revision"
 	defaultAgentRuntimeHTTPPort     int32 = 8080
@@ -40,7 +40,7 @@ const (
 
 var errLASCredentialRevisionMismatch = errors.New("LAS credential revision is not applied to the Pod template")
 
-//go:embed chart/langgraph-cloud-0.3.5-splunk.1.tgz
+//go:embed chart/langgraph-cloud-0.3.5-splunk.2.tgz
 var lasChartArchive []byte
 
 // LASReconciler replaces the direct-managed agentruntime workload with LAS.

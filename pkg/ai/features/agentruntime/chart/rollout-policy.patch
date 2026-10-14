@@ -5,7 +5,7 @@
  name: langgraph-cloud
  type: application
 -version: 0.3.4
-+version: 0.3.5-splunk.1
++version: 0.3.5-splunk.2
 --- a/langgraph-cloud/values.yaml
 +++ b/langgraph-cloud/values.yaml
 @@ -112,6 +112,11 @@
@@ -32,6 +32,21 @@
      labels: {}
      annotations: {}
      podSecurityContext: {}
+@@ -243,6 +253,14 @@
+   autoscaling:
+     enabled: false
+     minReplicas: 1
+     maxReplicas: 5
+     targetCPUUtilizationPercentage: 80
++    behavior:
++      scaleDown:
++        stabilizationWindowSeconds: 300
++        selectPolicy: Min
++        policies:
++          - type: Pods
++            value: 1
++            periodSeconds: 60
+     keda:  #  KEDA autoscaling configuration. Recommended for autoscaling but only available if keda is installed in the cluster.
 --- a/langgraph-cloud/templates/api-server/deployment.yaml
 +++ b/langgraph-cloud/templates/api-server/deployment.yaml
 @@ -20,6 +20,8 @@
@@ -43,6 +58,17 @@
    selector:
      matchLabels:
        {{- include "langGraphCloud.selectorLabels" . | nindent 6 }}
+--- a/langgraph-cloud/templates/queue/hpa.yaml
++++ b/langgraph-cloud/templates/queue/hpa.yaml
+@@ -12,6 +12,8 @@
+     kind: Deployment
+     name: {{ include "langGraphCloud.fullname" . }}-{{ .Values.queue.name }}
+   minReplicas: {{ .Values.queue.autoscaling.minReplicas }}
+   maxReplicas: {{ .Values.queue.autoscaling.maxReplicas }}
++  behavior:
++    {{- toYaml .Values.queue.autoscaling.behavior | nindent 4 }}
+   metrics:
+     {{- if .Values.queue.autoscaling.targetCPUUtilizationPercentage }}
 --- a/langgraph-cloud/templates/queue/deployment.yaml
 +++ b/langgraph-cloud/templates/queue/deployment.yaml
 @@ -21,6 +21,8 @@

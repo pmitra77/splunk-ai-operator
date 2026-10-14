@@ -13,6 +13,7 @@ import (
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -216,6 +217,87 @@ func TestLASQueueAutoscalingValuesUseDefaultsAndOverrides(t *testing.T) {
 	})
 	if configured["enabled"] != false || configured["minReplicas"] != minReplicas || configured["maxReplicas"] != maxReplicas || configured["targetCPUUtilizationPercentage"] != targetCPU {
 		t.Fatalf("queue autoscaling overrides were not mapped: %#v", configured)
+	}
+}
+
+func TestLASQueueHPAScaleDownPolicyRendersOnlyWhenEnabled(t *testing.T) {
+	chart, err := loader.LoadArchive(bytes.NewReader(lasChartArchive))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, enabled := range []bool{true, false} {
+		t.Run(map[bool]string{true: "enabled", false: "disabled"}[enabled], func(t *testing.T) {
+			minReplicas, maxReplicas, targetCPU := int32(2), int32(6), int32(65)
+			ai := &aiv1.AIService{}
+			ai.Name = "fixture"
+			ai.Spec.Feature = aiv1.FeatureSpec{
+				Name: "agentruntime",
+				LAS: &aiv1.LASFeatureSpec{
+					Image:       aiv1.LASImageSpec{Repository: "registry.example/fixture", Tag: "candidate-123"},
+					AssistantID: "contract_fixture",
+					Queue: &aiv1.LASQueueSpec{Autoscaling: &aiv1.LASQueueAutoscalingSpec{
+						Enabled: &enabled, MinReplicas: &minReplicas, MaxReplicas: &maxReplicas,
+						TargetCPUUtilizationPercentage: &targetCPU,
+					}},
+				},
+			}
+			renderValues, err := chartutil.ToRenderValues(chart, lasValues(ai), chartutil.ReleaseOptions{Name: "las-fixture", Namespace: "default"}, chartutil.DefaultCapabilities)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rendered, err := engine.Render(chart, renderValues)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			queueDeploymentTemplate := "langgraph-cloud/templates/queue/deployment.yaml"
+			queueHPATemplate := "langgraph-cloud/templates/queue/hpa.yaml"
+			apiHPATemplate := "langgraph-cloud/templates/api-server/hpa.yaml"
+			var queueDeployment appsv1.Deployment
+			if err := yaml.Unmarshal([]byte(rendered[queueDeploymentTemplate]), &queueDeployment); err != nil {
+				t.Fatalf("parse queue Deployment: %v", err)
+			}
+			if strings.TrimSpace(rendered[apiHPATemplate]) != "" {
+				t.Fatal("API HPA must remain disabled")
+			}
+
+			if !enabled {
+				if strings.TrimSpace(rendered[queueHPATemplate]) != "" {
+					t.Fatal("queue HPA rendered while autoscaling is disabled")
+				}
+				if queueDeployment.Spec.Replicas == nil || *queueDeployment.Spec.Replicas != 1 {
+					t.Errorf("disabled queue replicas = %v, want one fixed replica", queueDeployment.Spec.Replicas)
+				}
+				return
+			}
+
+			if queueDeployment.Spec.Replicas != nil {
+				t.Errorf("enabled queue Deployment sets fixed replicas %d; HPA must own replica count", *queueDeployment.Spec.Replicas)
+			}
+			var hpa autoscalingv2.HorizontalPodAutoscaler
+			if err := yaml.Unmarshal([]byte(rendered[queueHPATemplate]), &hpa); err != nil {
+				t.Fatalf("parse queue HPA: %v", err)
+			}
+			if hpa.Spec.MinReplicas == nil || *hpa.Spec.MinReplicas != minReplicas || hpa.Spec.MaxReplicas != maxReplicas {
+				t.Errorf("queue HPA bounds = min %v max %d, want min %d max %d", hpa.Spec.MinReplicas, hpa.Spec.MaxReplicas, minReplicas, maxReplicas)
+			}
+			if len(hpa.Spec.Metrics) != 1 || hpa.Spec.Metrics[0].Resource == nil || hpa.Spec.Metrics[0].Resource.Name != corev1.ResourceCPU || hpa.Spec.Metrics[0].Resource.Target.AverageUtilization == nil || *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization != targetCPU {
+				t.Errorf("queue HPA metrics = %#v, want CPU utilization target %d", hpa.Spec.Metrics, targetCPU)
+			}
+			behavior := hpa.Spec.Behavior
+			if behavior == nil || behavior.ScaleDown == nil {
+				t.Fatal("queue HPA is missing the ERD scale-down behavior")
+			}
+			scaleDown := behavior.ScaleDown
+			if scaleDown.StabilizationWindowSeconds == nil || *scaleDown.StabilizationWindowSeconds != 300 || scaleDown.SelectPolicy == nil || *scaleDown.SelectPolicy != autoscalingv2.MinChangePolicySelect || len(scaleDown.Policies) != 1 {
+				t.Fatalf("queue HPA scale-down behavior = %#v, want 300s stabilization and one Min policy", scaleDown)
+			}
+			policy := scaleDown.Policies[0]
+			if policy.Type != autoscalingv2.PodsScalingPolicy || policy.Value != 1 || policy.PeriodSeconds != 60 {
+				t.Errorf("queue HPA scale-down policy = %#v, want one Pod per 60 seconds", policy)
+			}
+		})
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/splunk/splunk-ai-operator/pkg/ai/raybuilder"
 	"github.com/splunk/splunk-ai-operator/pkg/ai/sidecars"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -111,6 +112,14 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		}
 		conditions = append(conditions, cond)
 		if err != nil {
+			conditions = append(conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             stage.name + "Failed",
+				Message:            err.Error(),
+				ObservedGeneration: p.Generation,
+				LastTransitionTime: metav1.Now(),
+			})
 			return reconcile.Result{}, err
 		}
 	}
@@ -428,6 +437,15 @@ func (r *AIPlatformReconciler) CheckAIServiceStatus(ctx context.Context, platfor
 					"message", cond.Message)
 				return fmt.Errorf("AIService %s has failed condition %s: %s",
 					child.Name, cond.Type, cond.Message)
+			}
+		}
+		if child.Spec.Feature.Name == agentRuntimeFeatureName && child.Spec.Feature.LAS != nil {
+			ready := meta.FindStatusCondition(child.Status.Conditions, "Ready")
+			if child.Status.ObservedGeneration < child.Generation || ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration < child.Generation {
+				if ready == nil {
+					return fmt.Errorf("AIService %s LAS Ready condition is not available for generation %d", child.Name, child.Generation)
+				}
+				return fmt.Errorf("AIService %s LAS Ready condition is %s for generation %d (observed generation %d, reason %s): %s", child.Name, ready.Status, child.Generation, ready.ObservedGeneration, ready.Reason, ready.Message)
 			}
 		}
 	}

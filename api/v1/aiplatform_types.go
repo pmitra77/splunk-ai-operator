@@ -247,7 +247,7 @@ type LASFeatureSpec struct {
 	// are supplied through Kubernetes Secrets, never stored in this resource.
 	// +kubebuilder:validation:Optional
 	Tracing *LASTracingSpec `json:"tracing,omitempty"`
-	// Queue configures the LAS queue workload and its optional CPU-based autoscaler.
+	// Queue configures the LAS queue workload and its CPU-based autoscaler, enabled by default.
 	// +kubebuilder:validation:Optional
 	Queue *LASQueueSpec `json:"queue,omitempty"`
 }
@@ -286,17 +286,17 @@ type LASWorkloadSpec struct {
 // LASQueueSpec configures the queue workload and horizontal autoscaling.
 type LASQueueSpec struct {
 	LASWorkloadSpec `json:",inline"`
-	// Autoscaling controls the queue HorizontalPodAutoscaler. It is optional to
-	// preserve the AIP-5391 behavior, where queue autoscaling was not configured.
+	// Autoscaling controls the queue HorizontalPodAutoscaler. Autoscaling is enabled
+	// by default; explicitly set enabled=false to use one fixed queue worker.
 	// +kubebuilder:validation:Optional
 	Autoscaling *LASQueueAutoscalingSpec `json:"autoscaling,omitempty"`
 }
 
 // LASQueueAutoscalingSpec defines bounds and the CPU utilization target.
 type LASQueueAutoscalingSpec struct {
-	// Enabled controls whether the queue HPA is created. Defaults to false to
-	// preserve the AIP-5391 chart behavior unless autoscaling is explicitly enabled.
-	// +kubebuilder:default=false
+	// Enabled controls whether the queue HPA is created. Defaults to true; set false
+	// to use one fixed queue worker.
+	// +kubebuilder:default=true
 	Enabled *bool `json:"enabled,omitempty"`
 	// MinReplicas is the minimum number of queue Pods. Defaults to 1.
 	// +kubebuilder:validation:Minimum=1

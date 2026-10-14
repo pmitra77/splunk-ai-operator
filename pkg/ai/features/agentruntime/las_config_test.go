@@ -20,6 +20,8 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+func ptrInt32(value int32) *int32 { return &value }
+
 func TestLASRolloutPolicyReachesBothDeployments(t *testing.T) {
 	ai := &aiv1.AIService{}
 	ai.Name = "fixture"
@@ -206,7 +208,7 @@ func TestLASTracingSettingsReachAPIAndQueueWorkloads(t *testing.T) {
 
 func TestLASQueueAutoscalingValuesUseDefaultsAndOverrides(t *testing.T) {
 	defaults := lasQueueAutoscalingValues(nil)
-	if defaults["enabled"] != false || defaults["minReplicas"] != int32(1) || defaults["maxReplicas"] != int32(3) || defaults["targetCPUUtilizationPercentage"] != int32(80) {
+	if defaults["enabled"] != true || defaults["minReplicas"] != int32(1) || defaults["maxReplicas"] != int32(3) || defaults["targetCPUUtilizationPercentage"] != int32(80) {
 		t.Fatalf("unexpected queue autoscaling defaults: %#v", defaults)
 	}
 	enabled := false
@@ -301,7 +303,7 @@ func TestLASQueueHPAScaleDownPolicyRendersOnlyWhenEnabled(t *testing.T) {
 	}
 }
 
-func TestAIP5391QueueConfigKeepsHPAOptIn(t *testing.T) {
+func TestAIP5406QueueConfigDefaultsAutoscalingOn(t *testing.T) {
 	ai := &aiv1.AIService{}
 	ai.Spec.Feature.LAS = &aiv1.LASFeatureSpec{
 		Image:       aiv1.LASImageSpec{Repository: "registry.example/fixture", Tag: "candidate-123"},
@@ -310,8 +312,92 @@ func TestAIP5391QueueConfigKeepsHPAOptIn(t *testing.T) {
 	}
 	values := lasValues(ai)
 	queue := values["queue"].(map[string]interface{})
+	if queue["autoscaling"].(map[string]interface{})["enabled"] != true {
+		t.Fatal("queue configuration without an explicit opt-out must create an HPA")
+	}
+	disabled := false
+	ai.Spec.Feature.LAS.Queue.Autoscaling = &aiv1.LASQueueAutoscalingSpec{Enabled: &disabled}
+	queue = lasValues(ai)["queue"].(map[string]interface{})
 	if queue["autoscaling"].(map[string]interface{})["enabled"] != false {
-		t.Fatal("AIP-5391 queue configuration without autoscaling must not create an HPA")
+		t.Fatal("explicit autoscaling opt-out must disable the queue HPA")
+	}
+}
+
+func TestLASQueueHPAContractRendersCPUOnlyAndPreservesReplicaOwnership(t *testing.T) {
+	chart, err := loader.LoadArchive(bytes.NewReader(lasChartArchive))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name      string
+		autoscale *aiv1.LASQueueAutoscalingSpec
+		enabled   bool
+		min       int32
+		max       int32
+		cpuTarget int32
+	}{
+		{name: "ERD defaults", enabled: true, min: 1, max: 3, cpuTarget: 80},
+		{name: "explicit opt out", autoscale: &aiv1.LASQueueAutoscalingSpec{Enabled: ptrBool(false)}, enabled: false, min: 1, max: 3, cpuTarget: 80},
+		{name: "configured bounds", autoscale: &aiv1.LASQueueAutoscalingSpec{Enabled: ptrBool(true), MinReplicas: ptrInt32(2), MaxReplicas: ptrInt32(6), TargetCPUUtilizationPercentage: ptrInt32(65)}, enabled: true, min: 2, max: 6, cpuTarget: 65},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ai := &aiv1.AIService{}
+			ai.Name = "fixture"
+			ai.Spec.Feature = aiv1.FeatureSpec{Name: "agentruntime", LAS: &aiv1.LASFeatureSpec{
+				Image: aiv1.LASImageSpec{Repository: "registry.example/fixture", Tag: "candidate-1"}, AssistantID: "fixture",
+				Queue: &aiv1.LASQueueSpec{Autoscaling: test.autoscale},
+			}}
+			renderValues, err := chartutil.ToRenderValues(chart, lasValues(ai), chartutil.ReleaseOptions{Name: lasReleaseName(ai.Name), Namespace: "default"}, chartutil.DefaultCapabilities)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rendered, err := engine.Render(chart, renderValues)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var queueDeployment appsv1.Deployment
+			if err := yaml.Unmarshal([]byte(rendered["langgraph-cloud/templates/queue/deployment.yaml"]), &queueDeployment); err != nil {
+				t.Fatalf("parse queue Deployment: %v", err)
+			}
+			if strings.TrimSpace(rendered["langgraph-cloud/templates/api-server/hpa.yaml"]) != "" {
+				t.Fatal("API autoscaling must remain disabled")
+			}
+			queueHPAManifest := strings.TrimSpace(rendered["langgraph-cloud/templates/queue/hpa.yaml"])
+			if !test.enabled {
+				if queueHPAManifest != "" {
+					t.Fatal("queue HPA rendered while autoscaling is disabled")
+				}
+				if queueDeployment.Spec.Replicas == nil || *queueDeployment.Spec.Replicas != 1 {
+					t.Fatalf("disabled queue replicas = %v, want one fixed worker", queueDeployment.Spec.Replicas)
+				}
+				return
+			}
+			if queueDeployment.Spec.Replicas != nil {
+				t.Fatalf("enabled queue Deployment sets replicas %d; HPA must own the count", *queueDeployment.Spec.Replicas)
+			}
+			var hpa autoscalingv2.HorizontalPodAutoscaler
+			if err := yaml.Unmarshal([]byte(queueHPAManifest), &hpa); err != nil {
+				t.Fatalf("parse queue HPA: %v", err)
+			}
+			if hpa.Spec.ScaleTargetRef.Kind != "Deployment" || hpa.Spec.ScaleTargetRef.Name != lasReleaseName(ai.Name)+"-langgraph-cloud-queue" {
+				t.Errorf("queue HPA target = %#v", hpa.Spec.ScaleTargetRef)
+			}
+			if hpa.Spec.MinReplicas == nil || *hpa.Spec.MinReplicas != test.min || hpa.Spec.MaxReplicas != test.max {
+				t.Errorf("queue HPA bounds = min %v max %d, want min %d max %d", hpa.Spec.MinReplicas, hpa.Spec.MaxReplicas, test.min, test.max)
+			}
+			if len(hpa.Spec.Metrics) != 1 || hpa.Spec.Metrics[0].Type != autoscalingv2.ResourceMetricSourceType || hpa.Spec.Metrics[0].Resource == nil || hpa.Spec.Metrics[0].Resource.Name != corev1.ResourceCPU || hpa.Spec.Metrics[0].Resource.Target.AverageUtilization == nil || *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization != test.cpuTarget {
+				t.Errorf("queue HPA metrics = %#v, want one CPU utilization metric at %d%%", hpa.Spec.Metrics, test.cpuTarget)
+			}
+			if hpa.Spec.Behavior == nil || hpa.Spec.Behavior.ScaleDown == nil {
+				t.Fatal("queue HPA lacks the AIP-5394 scale-down policy")
+			}
+			scaleDown := hpa.Spec.Behavior.ScaleDown
+			if scaleDown.StabilizationWindowSeconds == nil || *scaleDown.StabilizationWindowSeconds != 300 || scaleDown.SelectPolicy == nil || *scaleDown.SelectPolicy != autoscalingv2.MinChangePolicySelect || len(scaleDown.Policies) != 1 || scaleDown.Policies[0].Type != autoscalingv2.PodsScalingPolicy || scaleDown.Policies[0].Value != 1 || scaleDown.Policies[0].PeriodSeconds != 60 {
+				t.Errorf("queue HPA scale-down policy = %#v", scaleDown)
+			}
+		})
 	}
 }
 

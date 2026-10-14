@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
@@ -18,6 +19,7 @@ import (
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -46,8 +48,10 @@ var lasChartArchive []byte
 // LASReconciler replaces the direct-managed agentruntime workload with LAS.
 type LASReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme             *runtime.Scheme
+	Recorder           record.EventRecorder
+	helmActionsFactory func(context.Context, string) (lasHelmActions, error)
+	healthClient       *http.Client
 }
 
 func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error {
@@ -66,18 +70,24 @@ func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error
 	if err != nil || chart.Metadata.Version != lasChartVersion {
 		return r.fail(ctx, ai, "ChartInvalid", fmt.Errorf("embedded LAS chart is not version %s", lasChartVersion))
 	}
-	config, err := r.helmConfig(ctx, ai.Namespace)
+	helm, err := r.helmActions(ctx, ai.Namespace)
 	if err != nil {
 		return r.fail(ctx, ai, "HelmConfigurationFailed", err)
 	}
 	name := lasReleaseName(ai.Name)
 	values := lasValues(ai, credentialRevision)
-	current, err := action.NewStatus(config).Run(name)
+	current, err := helm.Status(name)
 	if err != nil && !errors.Is(err, driver.ErrReleaseNotFound) {
 		return r.fail(ctx, ai, "HelmStatusFailed", err)
 	}
 	if current != nil && current.Labels[lasOwnerLabel] != string(ai.UID) {
 		return r.fail(ctx, ai, "ReleaseOwnershipConflict", fmt.Errorf("Helm release %q is not owned by this AIService", name))
+	}
+	if current != nil && current.Info == nil {
+		return r.fail(ctx, ai, "HelmStatusInvalid", fmt.Errorf("Helm release %s has no status information", name))
+	}
+	if current != nil && (current.Info.Status.IsPending() || current.Info.Status == release.StatusUninstalling) {
+		return r.recoverPendingHelmAction(ctx, ai, helm, current)
 	}
 	replaceUninstalled := current != nil && current.Info.Status == release.StatusUninstalled
 	if replaceUninstalled {
@@ -89,26 +99,26 @@ func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error
 			return err
 		}
 		r.event(ai, corev1.EventTypeNormal, "LASInstalling", fmt.Sprintf("Installing Helm release %s", name))
-		install := action.NewInstall(config)
-		install.ReleaseName = name
-		install.Namespace = ai.Namespace
-		install.Replace = replaceUninstalled
-		install.Labels = map[string]string{lasOwnerLabel: string(ai.UID)}
-		install.Wait = true
-		install.Atomic = true
-		install.Timeout = 5 * time.Minute
-		current, err = install.RunWithContext(ctx, chart, values)
+		current, err = helm.Install(ctx, name, chart, values, replaceUninstalled, string(ai.UID))
 		if err != nil {
 			return r.fail(ctx, ai, "HelmInstallFailed", err)
 		}
 		r.event(ai, corev1.EventTypeNormal, "LASInstalled", fmt.Sprintf("Installed Helm release %s revision %d", name, current.Version))
 	} else {
-		needsUpgrade := !sameValues(current.Config, values) || current.Chart.Metadata.Version != lasChartVersion || current.Info.Status != release.StatusDeployed
+		needsUpgrade := !lasDesiredReleaseApplied(current, values)
 		if !needsUpgrade {
 			if err := r.checkDeployments(ctx, ai, name, credentialRevision); apierrors.IsNotFound(err) || errors.Is(err, errLASCredentialRevisionMismatch) {
 				needsUpgrade = true
 			} else if err != nil {
 				return r.fail(ctx, ai, "WorkloadsNotReady", err)
+			}
+			if !needsUpgrade && lasQueueAutoscalingEnabled(ai) {
+				hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+				if err := r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: name + "-langgraph-cloud-queue"}, hpa); apierrors.IsNotFound(err) {
+					needsUpgrade = true
+				} else if err != nil {
+					return r.fail(ctx, ai, "ScalingObservationFailed", err)
+				}
 			}
 		}
 		if needsUpgrade {
@@ -116,31 +126,38 @@ func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error
 				return err
 			}
 			r.event(ai, corev1.EventTypeNormal, "LASUpgrading", fmt.Sprintf("Upgrading Helm release %s", name))
-			upgrade := action.NewUpgrade(config)
-			upgrade.Namespace = ai.Namespace
-			upgrade.Labels = map[string]string{lasOwnerLabel: string(ai.UID)}
-			upgrade.Wait = true
-			upgrade.Atomic = true
-			upgrade.Timeout = 5 * time.Minute
-			current, err = upgrade.RunWithContext(ctx, name, chart, values)
+			current, err = helm.Upgrade(ctx, name, chart, values, string(ai.UID))
 			if err != nil {
 				return r.fail(ctx, ai, "HelmUpgradeFailed", err)
 			}
 			r.event(ai, corev1.EventTypeNormal, "LASUpgraded", fmt.Sprintf("Upgraded Helm release %s to revision %d", name, current.Version))
 		}
 	}
+	if !lasDesiredReleaseApplied(current, values) {
+		return r.fail(ctx, ai, "DesiredRevisionNotApplied", fmt.Errorf("LAS Helm release %s has not applied the requested configuration", name))
+	}
 
+	if err := r.setScalingCondition(ctx, ai, r.queueScalingCondition(ctx, ai, name)); err != nil {
+		return err
+	}
 	if err := r.checkDeployments(ctx, ai, name, credentialRevision); err != nil {
 		return r.fail(ctx, ai, "WorkloadsNotReady", err)
 	}
 	if err := r.ensureStableService(ctx, ai, name); err != nil {
 		return r.fail(ctx, ai, "ServiceFailed", err)
 	}
+	service, err := r.checkStableServiceEndpoints(ctx, ai, name)
+	if err != nil {
+		return r.fail(ctx, ai, "ServiceEndpointsNotReady", err)
+	}
+	if err := r.checkAPIHealth(ctx, ai, service); err != nil {
+		return r.fail(ctx, ai, "APIHealthCheckFailed", err)
+	}
 	if err := r.removeLegacyResources(ctx, ai); err != nil {
 		return r.fail(ctx, ai, "LegacyCleanupFailed", err)
 	}
 	wasReady := meta.IsStatusConditionTrue(ai.Status.Conditions, "Ready")
-	if err := r.setCondition(ctx, ai, metav1.ConditionTrue, "LASReady", fmt.Sprintf("LAS Helm release %s revision %d is deployed; API and queue are ready", name, current.Version)); err != nil {
+	if err := r.setCondition(ctx, ai, metav1.ConditionTrue, "LASReady", fmt.Sprintf("LAS Helm release %s revision %d is current; API health and Service endpoints are ready, and the queue minimum is available", name, current.Version)); err != nil {
 		return err
 	}
 	if !wasReady {
@@ -155,33 +172,58 @@ func (r *LASReconciler) Finalize(ctx context.Context, ai *aiv1.AIService) (final
 			r.event(ai, corev1.EventTypeWarning, "LASUninstallFailed", finalizeErr.Error())
 		}
 	}()
-	config, err := r.helmConfig(ctx, ai.Namespace)
+	helm, err := r.helmActions(ctx, ai.Namespace)
 	if err != nil {
 		return err
 	}
 	name := lasReleaseName(ai.Name)
-	current, err := action.NewStatus(config).Run(name)
+	current, err := helm.Status(name)
 	if errors.Is(err, driver.ErrReleaseNotFound) {
-		return nil
+		return r.removeStableService(ctx, ai)
 	}
 	if err != nil {
 		return err
 	}
-	if current.Info.Status == release.StatusUninstalled {
-		return nil
-	}
 	if current.Labels[lasOwnerLabel] != string(ai.UID) {
 		return fmt.Errorf("refusing to uninstall Helm release %q: owner UID does not match AIService", name)
 	}
+	if current.Info == nil {
+		return fmt.Errorf("Helm release %s has no status information", name)
+	}
+	if current.Info.Status == release.StatusUninstalled {
+		return r.removeStableService(ctx, ai)
+	}
+	if current.Info.Status.IsPending() || current.Info.Status == release.StatusUninstalling {
+		if _, ok := lasPendingActionStartedAt(current); !ok {
+			return fmt.Errorf("Helm release %s revision %d has no action timestamp; deletion requires inspection", name, current.Version)
+		}
+		if !lasPendingActionExpired(current, time.Now()) {
+			return fmt.Errorf("waiting for pending Helm release %q revision %d before deletion", name, current.Version)
+		}
+	}
 	r.event(ai, corev1.EventTypeNormal, "LASUninstalling", fmt.Sprintf("Uninstalling Helm release %s", name))
-	uninstall := action.NewUninstall(config)
-	uninstall.Wait = true
-	uninstall.Timeout = 5 * time.Minute
-	if _, err := uninstall.Run(name); err != nil && !errors.Is(err, driver.ErrReleaseNotFound) {
+	if err := helm.Uninstall(name); err != nil && !errors.Is(err, driver.ErrReleaseNotFound) {
 		return err
 	}
 	r.event(ai, corev1.EventTypeNormal, "LASUninstalled", fmt.Sprintf("Uninstalled Helm release %s", name))
-	return nil
+	return r.removeStableService(ctx, ai)
+}
+
+func (r *LASReconciler) helmActions(ctx context.Context, namespace string) (lasHelmActions, error) {
+	if r.helmActionsFactory != nil {
+		return r.helmActionsFactory(ctx, namespace)
+	}
+	config, err := r.helmConfig(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
+	return &lasActionClient{config: config, namespace: namespace}, nil
+}
+
+func lasDesiredReleaseApplied(current *release.Release, values map[string]interface{}) bool {
+	return current != nil && current.Info != nil && current.Info.Status == release.StatusDeployed &&
+		current.Chart != nil && current.Chart.Metadata != nil && current.Chart.Metadata.Version == lasChartVersion &&
+		sameValues(current.Config, values)
 }
 
 func (r *LASReconciler) helmConfig(ctx context.Context, namespace string) (*action.Configuration, error) {
@@ -249,10 +291,10 @@ func lasValues(ai *aiv1.AIService, credentialRevisions ...string) map[string]int
 	}
 	applyLASTracing(values, ai.Spec.Feature.LAS.Tracing)
 	apiDeployment := values["apiServer"].(map[string]interface{})["deployment"].(map[string]interface{})
-	apiDeployment["annotations"] = map[string]string{lasCredentialRevisionAnnotation: credentialRevision}
+	apiDeployment["annotations"] = map[string]interface{}{lasCredentialRevisionAnnotation: credentialRevision}
 	applyLASWorkloadScheduling(apiDeployment, ai.Spec.Feature.LAS.API)
 	queueDeployment := values["queue"].(map[string]interface{})["deployment"].(map[string]interface{})
-	queueDeployment["annotations"] = map[string]string{lasCredentialRevisionAnnotation: credentialRevision}
+	queueDeployment["annotations"] = map[string]interface{}{lasCredentialRevisionAnnotation: credentialRevision}
 	applyLASWorkloadScheduling(queueDeployment, queue.LASWorkloadSpec)
 	if len(ai.Spec.ImagePullSecrets) > 0 {
 		refs := make([]map[string]string, 0, len(ai.Spec.ImagePullSecrets))
@@ -275,7 +317,7 @@ func lasRolloutStrategyValues() map[string]interface{} {
 }
 
 func lasQueueAutoscalingValues(autoscaling *aiv1.LASQueueAutoscalingSpec) map[string]interface{} {
-	values := map[string]interface{}{"enabled": false, "minReplicas": int32(1), "maxReplicas": int32(3), "targetCPUUtilizationPercentage": int32(80)}
+	values := map[string]interface{}{"enabled": true, "minReplicas": int32(1), "maxReplicas": int32(3), "targetCPUUtilizationPercentage": int32(80)}
 	if autoscaling == nil {
 		return values
 	}
@@ -444,14 +486,27 @@ func (r *LASReconciler) credentialRevision(ctx context.Context, ai *aiv1.AIServi
 }
 
 func (r *LASReconciler) checkDeployments(ctx context.Context, ai *aiv1.AIService, name, credentialRevision string) error {
-	for _, suffix := range []string{"-langgraph-cloud-api-server", "-langgraph-cloud-queue"} {
+	for _, workload := range []struct {
+		suffix   string
+		minimum  int32
+		fixedOne bool
+	}{{"-langgraph-cloud-api-server", 1, true}, {"-langgraph-cloud-queue", lasQueueMinReplicas(ai), !lasQueueAutoscalingEnabled(ai)}} {
 		deployment := &appsv1.Deployment{}
-		deploymentName := name + suffix
+		deploymentName := name + workload.suffix
 		if err := r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: deploymentName}, deployment); err != nil {
 			return fmt.Errorf("LAS Deployment %s unavailable: %w", deploymentName, err)
 		}
-		if deployment.Spec.Replicas == nil || deployment.Status.ObservedGeneration < deployment.Generation || deployment.Status.ReadyReplicas < *deployment.Spec.Replicas {
-			return fmt.Errorf("LAS Deployment %s is not ready", deploymentName)
+		if deployment.Status.ObservedGeneration < deployment.Generation {
+			return fmt.Errorf("LAS Deployment %s has not observed generation %d (observed %d)", deploymentName, deployment.Generation, deployment.Status.ObservedGeneration)
+		}
+		if workload.fixedOne && (deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 1) {
+			if workload.suffix == "-langgraph-cloud-queue" {
+				return fmt.Errorf("LAS queue Deployment %s must converge to one fixed replica while autoscaling is disabled", deploymentName)
+			}
+			return fmt.Errorf("LAS API Deployment %s must request exactly one replica", deploymentName)
+		}
+		if deployment.Status.ReadyReplicas < workload.minimum {
+			return fmt.Errorf("LAS Deployment %s has %d ready replicas; minimum required is %d", deploymentName, deployment.Status.ReadyReplicas, workload.minimum)
 		}
 		if deployment.Spec.Template.Annotations[lasCredentialRevisionAnnotation] != credentialRevision {
 			return fmt.Errorf("%w: LAS Deployment %s", errLASCredentialRevisionMismatch, deploymentName)
@@ -498,12 +553,7 @@ func (r *LASReconciler) ensureStableService(ctx context.Context, ai *aiv1.AIServ
 func (r *LASReconciler) setCondition(ctx context.Context, ai *aiv1.AIService, status metav1.ConditionStatus, reason, message string) error {
 	before := ai.DeepCopy()
 	// Conditions from the former direct-managed runtime describe resources LAS no longer uses.
-	ready := meta.FindStatusCondition(ai.Status.Conditions, "Ready")
-	if ready == nil {
-		ai.Status.Conditions = nil
-	} else {
-		ai.Status.Conditions = []metav1.Condition{*ready}
-	}
+	keepLASConditions(ai)
 	condition := metav1.Condition{Type: "Ready", Status: status, Reason: reason, Message: message, ObservedGeneration: ai.Generation}
 	meta.SetStatusCondition(&ai.Status.Conditions, condition)
 	ai.Status.ObservedGeneration = ai.Generation

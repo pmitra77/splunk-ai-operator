@@ -7,6 +7,7 @@ import (
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -18,6 +19,7 @@ func buildAgentRuntimeTestScheme(t *testing.T) *runtime.Scheme {
 		aiv1.AddToScheme,
 		corev1.AddToScheme,
 		appsv1.AddToScheme,
+		autoscalingv2.AddToScheme,
 		monitoringv1.AddToScheme,
 		certmanagerv1.AddToScheme,
 	} {

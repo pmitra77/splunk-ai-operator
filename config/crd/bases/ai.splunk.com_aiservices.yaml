@@ -2592,7 +2592,7 @@ spec:
                         type: string
                       queue:
                         description: Queue configures the LAS queue workload and its
-                          optional CPU-based autoscaler.
+                          CPU-based autoscaler, enabled by default.
                         properties:
                           affinity:
                             description: Affinity defines pod affinity and anti-affinity
@@ -3525,14 +3525,14 @@ spec:
                             type: object
                           autoscaling:
                             description: |-
-                              Autoscaling controls the queue HorizontalPodAutoscaler. It is optional to
-                              preserve the AIP-5391 behavior, where queue autoscaling was not configured.
+                              Autoscaling controls the queue HorizontalPodAutoscaler. Autoscaling is enabled
+                              by default; explicitly set enabled=false to use one fixed queue worker.
                             properties:
                               enabled:
-                                default: false
+                                default: true
                                 description: |-
-                                  Enabled controls whether the queue HPA is created. Defaults to false to
-                                  preserve the AIP-5391 chart behavior unless autoscaling is explicitly enabled.
+                                  Enabled controls whether the queue HPA is created. Defaults to true; set false
+                                  to use one fixed queue worker.
                                 type: boolean
                               maxReplicas:
                                 default: 3

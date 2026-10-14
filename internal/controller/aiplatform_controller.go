@@ -177,14 +177,21 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named("aiplatform").
-		For(&aiv1.AIPlatform{}).
-		// AIPlatform is the source of truth for AIService spec, so child updates
-		// must not wake the parent into a spec-write loop. Reconcile on delete so
-		// missing children are recreated; primary AIPlatform changes still flow
-		// through the .For(AIPlatform) watch above.
+		For(&aiv1.AIPlatform{}, builder.WithPredicates(predicate.Or(
+			common.GenerationChangedPredicate(),
+			common.AnnotationChangedPredicate(),
+			common.LabelChangedPredicate(),
+		))).
+		// AIPlatform remains the source of truth for child specs. Only child Ready
+		// transitions wake the parent for LAS status aggregation; delete still
+		// reconciles missing children.
 		Owns(&aiv1.AIService{}, builder.WithPredicates(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool { return false },
-			UpdateFunc: func(e event.UpdateEvent) bool { return false },
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				oldService, oldOK := e.ObjectOld.(*aiv1.AIService)
+				newService, newOK := e.ObjectNew.(*aiv1.AIService)
+				return oldOK && newOK && aiServiceReadyChanged(oldService, newService)
+			},
 			DeleteFunc: func(e event.DeleteEvent) bool { return !e.DeleteStateUnknown },
 		})).
 		// Infra owned by AIPlatform itself - with specific predicates
@@ -201,17 +208,36 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// RBAC resources for Ray autoscaler
 		Owns(&rbacv1.Role{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&rbacv1.RoleBinding{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		// Keep platform predicates light and scoped to the primary resource
-		WithEventFilter(predicate.Or(
-			common.GenerationChangedPredicate(),
-			common.AnnotationChangedPredicate(),
-			common.LabelChangedPredicate(),
-		)).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: aiv1.TotalWorker,
 		})
 
 	return b.Complete(r)
+}
+
+func aiServiceReadyChanged(oldService, newService *aiv1.AIService) bool {
+	if oldService == nil || newService == nil {
+		return false
+	}
+	if oldService.Spec.Feature.LAS == nil && newService.Spec.Feature.LAS == nil {
+		return false
+	}
+	oldReady := findReadyCondition(oldService.Status.Conditions)
+	newReady := findReadyCondition(newService.Status.Conditions)
+	if oldReady == nil || newReady == nil {
+		return oldReady != newReady
+	}
+	return oldReady.Status != newReady.Status || oldReady.Reason != newReady.Reason ||
+		oldReady.Message != newReady.Message || oldReady.ObservedGeneration != newReady.ObservedGeneration
+}
+
+func findReadyCondition(conditions []metav1.Condition) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == "Ready" {
+			return &conditions[i]
+		}
+	}
+	return nil
 }
 
 // finalizePlatform deletes platform‑owned children and waits until they are gone.

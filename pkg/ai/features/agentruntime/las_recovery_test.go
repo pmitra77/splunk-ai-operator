@@ -3,6 +3,9 @@ package agentruntime
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +15,7 @@ import (
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	helmtime "helm.sh/helm/v3/pkg/time"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +32,18 @@ type fakeLASHelmActions struct {
 	installCalls   int
 	rollbackTo     int
 	uninstallCalls int
+}
+
+type lasRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTripper lasRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTripper(request)
+}
+
+func lasHealthClient(statusCode int) *http.Client {
+	return &http.Client{Transport: lasRoundTripper(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: statusCode, Body: io.NopCloser(strings.NewReader("ok")), Header: make(http.Header), Request: request}, nil
+	})}
 }
 
 func (h *fakeLASHelmActions) Status(string) (*release.Release, error) {
@@ -92,7 +108,7 @@ func testLASRelease(name, owner string, status release.Status, version int, star
 func testLASReconciler(t *testing.T, helm *fakeLASHelmActions, includeSecrets bool, extra ...client.Object) (*LASReconciler, *aiv1.AIService) {
 	t.Helper()
 	ai := &aiv1.AIService{
-		ObjectMeta: metav1.ObjectMeta{Name: "fixture", Namespace: "default", UID: types.UID("service-uid")},
+		ObjectMeta: metav1.ObjectMeta{Name: "fixture", Namespace: "default", UID: types.UID("service-uid"), Generation: 1},
 		Spec: aiv1.AIServiceSpec{Feature: aiv1.FeatureSpec{
 			Name: "agentruntime", LicenseSecretRef: "fixture-auth", PostgresSecretRef: "fixture-postgres", RedisSecretRef: "fixture-redis",
 			LAS: &aiv1.LASFeatureSpec{Image: aiv1.LASImageSpec{Repository: "registry.example/fixture", Tag: "candidate-1"}, AssistantID: "fixture"},
@@ -108,8 +124,8 @@ func testLASReconciler(t *testing.T, helm *fakeLASHelmActions, includeSecrets bo
 	}
 	objects = append(objects, extra...)
 	scheme := buildAgentRuntimeTestScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}).WithObjects(objects...).Build()
-	r := &LASReconciler{Client: c, Scheme: scheme, helmActionsFactory: func(context.Context, string) (lasHelmActions, error) { return helm, nil }}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&aiv1.AIService{}, &appsv1.Deployment{}).WithObjects(objects...).Build()
+	r := &LASReconciler{Client: c, Scheme: scheme, healthClient: lasHealthClient(http.StatusOK), helmActionsFactory: func(context.Context, string) (lasHelmActions, error) { return helm, nil }}
 	return r, ai
 }
 

@@ -503,3 +503,45 @@ func TestCheckAIServiceStatus_FailsWhenServiceHasFailedCondition(t *testing.T) {
 	assert.Contains(t, err.Error(), "PostInstallHookReady")
 	assert.Contains(t, err.Error(), "still running")
 }
+
+func TestCheckAIServiceStatus_RequiresCurrentLASReady(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		status   metav1.ConditionStatus
+		observed int64
+		wantErr  bool
+	}{
+		{name: "current Ready", status: metav1.ConditionTrue, observed: 3},
+		{name: "not Ready", status: metav1.ConditionFalse, observed: 3, wantErr: true},
+		{name: "stale generation", status: metav1.ConditionTrue, observed: 2, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := buildTestScheme(t)
+			platform := &aiApi.AIPlatform{ObjectMeta: metav1.ObjectMeta{Name: "platform", Namespace: "default", UID: types.UID("platform-uid")}}
+			child := &aiApi.AIService{
+				ObjectMeta: metav1.ObjectMeta{Name: "platform-agentruntime", Namespace: "default", Generation: 3},
+				Spec:       aiApi.AIServiceSpec{Feature: aiApi.FeatureSpec{Name: agentRuntimeFeatureName, LAS: &aiApi.LASFeatureSpec{}}},
+				Status: aiApi.AIServiceStatus{ObservedGeneration: test.observed, Conditions: []metav1.Condition{{
+					Type: "Ready", Status: test.status, Reason: "LASReady", Message: "fixture condition", ObservedGeneration: test.observed,
+				}}},
+			}
+			require.NoError(t, controllerutil.SetControllerReference(platform, child, scheme))
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(platform, child).
+				WithIndex(&aiApi.AIService{}, ownerKey, func(obj client.Object) []string {
+					if owner := metav1.GetControllerOfNoCopy(obj); owner != nil {
+						return []string{owner.Name}
+					}
+					return nil
+				}).Build()
+			reconciler := &AIPlatformReconciler{Client: fakeClient, Scheme: scheme}
+			err := reconciler.CheckAIServiceStatus(context.Background(), platform)
+			if test.wantErr {
+				require.ErrorContains(t, err, "LAS Ready condition")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
@@ -18,6 +19,7 @@ import (
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -31,8 +33,8 @@ import (
 )
 
 const (
-	lasChartVersion                       = "0.3.5-splunk.1"
-	lasChartSHA256                        = "ef80afdef0c44a232946e67dc84521bed4e2b3a0234643eafc2ec811b6b092c8"
+	lasChartVersion                       = "0.3.5-splunk.2"
+	lasChartSHA256                        = "4fa2580f6e38254f399cc23e230f314dfdf42566f71df41ff1e4b23d36426058"
 	lasOwnerLabel                         = "ai.splunk.com/aiservice-uid"
 	lasCredentialRevisionAnnotation       = "ai.splunk.com/las-credential-revision"
 	defaultAgentRuntimeHTTPPort     int32 = 8080
@@ -40,7 +42,7 @@ const (
 
 var errLASCredentialRevisionMismatch = errors.New("LAS credential revision is not applied to the Pod template")
 
-//go:embed chart/langgraph-cloud-0.3.5-splunk.1.tgz
+//go:embed chart/langgraph-cloud-0.3.5-splunk.2.tgz
 var lasChartArchive []byte
 
 // LASReconciler replaces the direct-managed agentruntime workload with LAS.
@@ -49,6 +51,7 @@ type LASReconciler struct {
 	Scheme             *runtime.Scheme
 	Recorder           record.EventRecorder
 	helmActionsFactory func(context.Context, string) (lasHelmActions, error)
+	healthClient       *http.Client
 }
 
 func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error {
@@ -109,6 +112,14 @@ func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error
 			} else if err != nil {
 				return r.fail(ctx, ai, "WorkloadsNotReady", err)
 			}
+			if !needsUpgrade && lasQueueAutoscalingEnabled(ai) {
+				hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+				if err := r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: name + "-langgraph-cloud-queue"}, hpa); apierrors.IsNotFound(err) {
+					needsUpgrade = true
+				} else if err != nil {
+					return r.fail(ctx, ai, "ScalingObservationFailed", err)
+				}
+			}
 		}
 		if needsUpgrade {
 			if err := r.setCondition(ctx, ai, metav1.ConditionUnknown, "Upgrading", fmt.Sprintf("Upgrading LAS Helm release %s", name)); err != nil {
@@ -126,17 +137,27 @@ func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error
 		return r.fail(ctx, ai, "DesiredRevisionNotApplied", fmt.Errorf("LAS Helm release %s has not applied the requested configuration", name))
 	}
 
+	if err := r.setScalingCondition(ctx, ai, r.queueScalingCondition(ctx, ai, name)); err != nil {
+		return err
+	}
 	if err := r.checkDeployments(ctx, ai, name, credentialRevision); err != nil {
 		return r.fail(ctx, ai, "WorkloadsNotReady", err)
 	}
 	if err := r.ensureStableService(ctx, ai, name); err != nil {
 		return r.fail(ctx, ai, "ServiceFailed", err)
 	}
+	service, err := r.checkStableServiceEndpoints(ctx, ai, name)
+	if err != nil {
+		return r.fail(ctx, ai, "ServiceEndpointsNotReady", err)
+	}
+	if err := r.checkAPIHealth(ctx, ai, service); err != nil {
+		return r.fail(ctx, ai, "APIHealthCheckFailed", err)
+	}
 	if err := r.removeLegacyResources(ctx, ai); err != nil {
 		return r.fail(ctx, ai, "LegacyCleanupFailed", err)
 	}
 	wasReady := meta.IsStatusConditionTrue(ai.Status.Conditions, "Ready")
-	if err := r.setCondition(ctx, ai, metav1.ConditionTrue, "LASReady", fmt.Sprintf("LAS Helm release %s revision %d is deployed; API and queue are ready", name, current.Version)); err != nil {
+	if err := r.setCondition(ctx, ai, metav1.ConditionTrue, "LASReady", fmt.Sprintf("LAS Helm release %s revision %d is current; API health and Service endpoints are ready, and the queue minimum is available", name, current.Version)); err != nil {
 		return err
 	}
 	if !wasReady {
@@ -270,10 +291,10 @@ func lasValues(ai *aiv1.AIService, credentialRevisions ...string) map[string]int
 	}
 	applyLASTracing(values, ai.Spec.Feature.LAS.Tracing)
 	apiDeployment := values["apiServer"].(map[string]interface{})["deployment"].(map[string]interface{})
-	apiDeployment["annotations"] = map[string]string{lasCredentialRevisionAnnotation: credentialRevision}
+	apiDeployment["annotations"] = map[string]interface{}{lasCredentialRevisionAnnotation: credentialRevision}
 	applyLASWorkloadScheduling(apiDeployment, ai.Spec.Feature.LAS.API)
 	queueDeployment := values["queue"].(map[string]interface{})["deployment"].(map[string]interface{})
-	queueDeployment["annotations"] = map[string]string{lasCredentialRevisionAnnotation: credentialRevision}
+	queueDeployment["annotations"] = map[string]interface{}{lasCredentialRevisionAnnotation: credentialRevision}
 	applyLASWorkloadScheduling(queueDeployment, queue.LASWorkloadSpec)
 	if len(ai.Spec.ImagePullSecrets) > 0 {
 		refs := make([]map[string]string, 0, len(ai.Spec.ImagePullSecrets))
@@ -296,7 +317,7 @@ func lasRolloutStrategyValues() map[string]interface{} {
 }
 
 func lasQueueAutoscalingValues(autoscaling *aiv1.LASQueueAutoscalingSpec) map[string]interface{} {
-	values := map[string]interface{}{"enabled": false, "minReplicas": int32(1), "maxReplicas": int32(3), "targetCPUUtilizationPercentage": int32(80)}
+	values := map[string]interface{}{"enabled": true, "minReplicas": int32(1), "maxReplicas": int32(3), "targetCPUUtilizationPercentage": int32(80)}
 	if autoscaling == nil {
 		return values
 	}
@@ -465,14 +486,27 @@ func (r *LASReconciler) credentialRevision(ctx context.Context, ai *aiv1.AIServi
 }
 
 func (r *LASReconciler) checkDeployments(ctx context.Context, ai *aiv1.AIService, name, credentialRevision string) error {
-	for _, suffix := range []string{"-langgraph-cloud-api-server", "-langgraph-cloud-queue"} {
+	for _, workload := range []struct {
+		suffix   string
+		minimum  int32
+		fixedOne bool
+	}{{"-langgraph-cloud-api-server", 1, true}, {"-langgraph-cloud-queue", lasQueueMinReplicas(ai), !lasQueueAutoscalingEnabled(ai)}} {
 		deployment := &appsv1.Deployment{}
-		deploymentName := name + suffix
+		deploymentName := name + workload.suffix
 		if err := r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: deploymentName}, deployment); err != nil {
 			return fmt.Errorf("LAS Deployment %s unavailable: %w", deploymentName, err)
 		}
-		if deployment.Spec.Replicas == nil || deployment.Status.ObservedGeneration < deployment.Generation || deployment.Status.ReadyReplicas < *deployment.Spec.Replicas {
-			return fmt.Errorf("LAS Deployment %s is not ready", deploymentName)
+		if deployment.Status.ObservedGeneration < deployment.Generation {
+			return fmt.Errorf("LAS Deployment %s has not observed generation %d (observed %d)", deploymentName, deployment.Generation, deployment.Status.ObservedGeneration)
+		}
+		if workload.fixedOne && (deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 1) {
+			if workload.suffix == "-langgraph-cloud-queue" {
+				return fmt.Errorf("LAS queue Deployment %s must converge to one fixed replica while autoscaling is disabled", deploymentName)
+			}
+			return fmt.Errorf("LAS API Deployment %s must request exactly one replica", deploymentName)
+		}
+		if deployment.Status.ReadyReplicas < workload.minimum {
+			return fmt.Errorf("LAS Deployment %s has %d ready replicas; minimum required is %d", deploymentName, deployment.Status.ReadyReplicas, workload.minimum)
 		}
 		if deployment.Spec.Template.Annotations[lasCredentialRevisionAnnotation] != credentialRevision {
 			return fmt.Errorf("%w: LAS Deployment %s", errLASCredentialRevisionMismatch, deploymentName)
@@ -519,12 +553,7 @@ func (r *LASReconciler) ensureStableService(ctx context.Context, ai *aiv1.AIServ
 func (r *LASReconciler) setCondition(ctx context.Context, ai *aiv1.AIService, status metav1.ConditionStatus, reason, message string) error {
 	before := ai.DeepCopy()
 	// Conditions from the former direct-managed runtime describe resources LAS no longer uses.
-	ready := meta.FindStatusCondition(ai.Status.Conditions, "Ready")
-	if ready == nil {
-		ai.Status.Conditions = nil
-	} else {
-		ai.Status.Conditions = []metav1.Condition{*ready}
-	}
+	keepLASConditions(ai)
 	condition := metav1.Condition{Type: "Ready", Status: status, Reason: reason, Message: message, ObservedGeneration: ai.Generation}
 	meta.SetStatusCondition(&ai.Status.Conditions, condition)
 	ai.Status.ObservedGeneration = ai.Generation

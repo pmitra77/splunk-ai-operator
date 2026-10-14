@@ -83,7 +83,7 @@ func (r *LASReconciler) recoverPendingHelmAction(ctx context.Context, ai *aiv1.A
 		}
 		var target *release.Release
 		for _, previous := range history {
-			if previous == nil || previous.Info == nil || previous.Version >= latest.Version || previous.Info.Status != release.StatusDeployed {
+			if previous == nil || previous.Info == nil || previous.Version >= latest.Version || previous.Info.Status != release.StatusDeployed && previous.Info.Status != release.StatusSuperseded {
 				continue
 			}
 			if previous.Labels[lasOwnerLabel] != string(ai.UID) {
@@ -94,7 +94,7 @@ func (r *LASReconciler) recoverPendingHelmAction(ctx context.Context, ai *aiv1.A
 			}
 		}
 		if target == nil {
-			return r.fail(ctx, ai, "HelmRecoveryUnsafe", fmt.Errorf("Helm release %s has no UID-owned deployed revision to restore", name))
+			return r.fail(ctx, ai, "HelmRecoveryUnsafe", fmt.Errorf("Helm release %s has no UID-owned deployed or superseded revision to restore", name))
 		}
 		if err := helm.Rollback(name, target.Version); err != nil {
 			return r.fail(ctx, ai, "HelmRecoveryFailed", fmt.Errorf("restore LAS release %s revision %d: %w", name, target.Version, err))

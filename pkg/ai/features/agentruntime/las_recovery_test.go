@@ -133,6 +133,7 @@ func TestLASPendingActionObservationAndRecovery(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
 		status         release.Status
+		priorStatus    release.Status
 		age            time.Duration
 		wantReason     string
 		wantRollbackTo int
@@ -140,12 +141,17 @@ func TestLASPendingActionObservationAndRecovery(t *testing.T) {
 	}{
 		{name: "recent upgrade is observed", status: release.StatusPendingUpgrade, age: time.Minute, wantReason: "HelmActionPending"},
 		{name: "stale upgrade restores owned revision", status: release.StatusPendingUpgrade, age: 10 * time.Minute, wantReason: "DesiredRevisionNotApplied", wantRollbackTo: 1},
+		{name: "stale upgrade restores owned superseded revision", status: release.StatusPendingUpgrade, priorStatus: release.StatusSuperseded, age: 10 * time.Minute, wantReason: "DesiredRevisionNotApplied", wantRollbackTo: 1},
 		{name: "stale install is uninstalled", status: release.StatusPendingInstall, age: 10 * time.Minute, wantReason: "DesiredRevisionNotApplied", wantUninstall: 1},
 		{name: "stale uninstall is completed", status: release.StatusUninstalling, age: 10 * time.Minute, wantReason: "DesiredRevisionNotApplied", wantUninstall: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			helm := &fakeLASHelmActions{current: testLASRelease("las-fixture", "service-uid", tc.status, 2, time.Now().Add(-tc.age))}
-			helm.history = []*release.Release{testLASRelease("las-fixture", "service-uid", release.StatusDeployed, 1, time.Now().Add(-time.Hour)), helm.current}
+			priorStatus := tc.priorStatus
+			if priorStatus == "" {
+				priorStatus = release.StatusDeployed
+			}
+			helm.history = []*release.Release{testLASRelease("las-fixture", "service-uid", priorStatus, 1, time.Now().Add(-time.Hour)), helm.current}
 			r, ai := testLASReconciler(t, helm, true)
 			require.NoError(t, r.Reconcile(context.Background(), ai))
 			condition := meta.FindStatusCondition(ai.Status.Conditions, "Ready")
@@ -160,12 +166,16 @@ func TestLASPendingActionObservationAndRecovery(t *testing.T) {
 }
 
 func TestLASPendingRecoveryRefusesForeignHistory(t *testing.T) {
-	helm := &fakeLASHelmActions{current: testLASRelease("las-fixture", "service-uid", release.StatusPendingRollback, 2, time.Now().Add(-10*time.Minute))}
-	helm.history = []*release.Release{testLASRelease("las-fixture", "foreign-uid", release.StatusDeployed, 1, time.Now().Add(-time.Hour)), helm.current}
-	r, ai := testLASReconciler(t, helm, true)
-	require.ErrorContains(t, r.Reconcile(context.Background(), ai), "another owner")
-	require.Zero(t, helm.rollbackTo)
-	require.Equal(t, "ReleaseOwnershipConflict", meta.FindStatusCondition(ai.Status.Conditions, "Ready").Reason)
+	for _, priorStatus := range []release.Status{release.StatusDeployed, release.StatusSuperseded} {
+		t.Run(string(priorStatus), func(t *testing.T) {
+			helm := &fakeLASHelmActions{current: testLASRelease("las-fixture", "service-uid", release.StatusPendingRollback, 2, time.Now().Add(-10*time.Minute))}
+			helm.history = []*release.Release{testLASRelease("las-fixture", "foreign-uid", priorStatus, 1, time.Now().Add(-time.Hour)), helm.current}
+			r, ai := testLASReconciler(t, helm, true)
+			require.ErrorContains(t, r.Reconcile(context.Background(), ai), "another owner")
+			require.Zero(t, helm.rollbackTo)
+			require.Equal(t, "ReleaseOwnershipConflict", meta.FindStatusCondition(ai.Status.Conditions, "Ready").Reason)
+		})
+	}
 }
 
 func TestLASPendingRecoveryRequiresSafeHistoryAndTimestamp(t *testing.T) {

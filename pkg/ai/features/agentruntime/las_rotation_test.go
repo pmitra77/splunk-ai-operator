@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
 	"helm.sh/helm/v3/pkg/release"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -52,6 +54,16 @@ func TestLASCredentialRotationChangesRevisionForInPlaceSecretUpdates(t *testing.
 			for _, secret := range secrets {
 				if secret.Name == tc.secretName {
 					secret.Data[tc.dataKey] = []byte("rotated-payload-marker")
+				}
+			}
+			dataOnlyClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lasRotationObjects(ai, secrets)...).Build()
+			reconciler = &LASReconciler{Client: dataOnlyClient}
+			dataOnlyRevision, err := reconciler.credentialRevision(context.Background(), ai)
+			require.NoError(t, err)
+			require.Equal(t, before, dataOnlyRevision, "credential payload changes alone must not affect the metadata-only revision")
+
+			for _, secret := range secrets {
+				if secret.Name == tc.secretName {
 					secret.ResourceVersion = "2"
 				}
 			}
@@ -114,6 +126,7 @@ func TestLASCredentialRotationDoesNotExposeCredentialPayloads(t *testing.T) {
 	} {
 		for _, payload := range []string{"license-payload-marker", "langsmith-api-key-marker", "postgres-payload-marker", "redis-payload-marker"} {
 			require.NotContains(t, output, payload, "%s must contain Secret references/metadata only", label)
+			require.NotContains(t, output, base64.StdEncoding.EncodeToString([]byte(payload)), "%s must not contain base64-encoded Secret data", label)
 		}
 	}
 
@@ -182,23 +195,48 @@ func TestLASCredentialRevisionChangesWhenSecretIsRecreatedWithSameName(t *testin
 }
 
 func TestLASCredentialRevisionRemainsStableAfterControllerRestart(t *testing.T) {
-	ai, secrets := lasRotationFixture()
-	scheme := buildAgentRuntimeTestScheme(t)
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lasRotationObjects(ai, secrets)...).Build()
-	firstController := &LASReconciler{Client: kubeClient}
-	revision, err := firstController.credentialRevision(context.Background(), ai)
-	require.NoError(t, err)
-	current := testLASRelease(lasReleaseName(ai.Name), string(ai.UID), release.StatusDeployed, 1, time.Now())
-	current.Config = lasValues(ai, revision)
+	helperHelm := &fakeLASHelmActions{current: testLASRelease("las-fixture", "service-uid", release.StatusDeployed, 1, time.Now())}
+	reconciler, ai := testLASReconciler(t, helperHelm, true)
+	ctx := context.Background()
 
-	// A newly constructed reconciler simulates the controller restarting. It
-	// recomputes the same Secret revision and sees that Helm already applied it.
-	restartedController := &LASReconciler{Client: kubeClient}
-	restartedRevision, err := restartedController.credentialRevision(context.Background(), ai)
+	// Keep the restart fixture independent of HPA metrics; it exercises whether
+	// an unchanged Secret revision causes a Helm upgrade after controller restart.
+	ai.Spec.Feature.LAS.Queue = &aiv1.LASQueueSpec{Autoscaling: &aiv1.LASQueueAutoscalingSpec{Enabled: ptrBool(false)}}
+	require.NoError(t, reconciler.Update(ctx, ai))
+	revision, err := reconciler.credentialRevision(ctx, ai)
 	require.NoError(t, err)
-	require.Equal(t, revision, restartedRevision)
-	require.True(t, lasDesiredReleaseApplied(current, lasValues(ai, restartedRevision)))
-	require.Equal(t, 1, current.Version, "restart and repeated reconcile with unchanged Secret versions must not create a Helm revision")
+	helperHelm.current.Config = lasValues(ai, revision)
+
+	replicas := int32(1)
+	for _, suffix := range []string{"-langgraph-cloud-api-server", "-langgraph-cloud-queue"} {
+		deployment := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: lasReleaseName(ai.Name) + suffix, Namespace: ai.Namespace, Generation: 1},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &replicas,
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{lasCredentialRevisionAnnotation: revision}}},
+			},
+			Status: appsv1.DeploymentStatus{ObservedGeneration: 1, ReadyReplicas: 1},
+		}
+		require.NoError(t, reconciler.Create(ctx, deployment))
+	}
+	endpoints := &corev1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{Name: agentRuntimeServiceName(ai.Name), Namespace: ai.Namespace},
+		Subsets: []corev1.EndpointSubset{{
+			Addresses: []corev1.EndpointAddress{{IP: "10.0.0.10"}},
+			Ports:     []corev1.EndpointPort{{Name: "http", Port: defaultAgentRuntimeTargetPort}},
+		}},
+	}
+	require.NoError(t, reconciler.Create(ctx, endpoints))
+
+	// Recreate the controller while retaining the fake Kubernetes state and
+	// Helm release, then exercise the real reconcile decision path.
+	restarted := &LASReconciler{
+		Client: reconciler.Client, Scheme: reconciler.Scheme, Recorder: reconciler.Recorder,
+		healthClient: reconciler.healthClient, helmActionsFactory: reconciler.helmActionsFactory,
+	}
+	require.NoError(t, restarted.Reconcile(ctx, ai))
+	require.Zero(t, helperHelm.upgradeCalls, "unchanged Secret versions after restart must not trigger Helm upgrade")
+	require.Equal(t, 1, helperHelm.current.Version)
 }
 
 func TestLASInvalidSecretDoesNotUpgradeExistingRelease(t *testing.T) {

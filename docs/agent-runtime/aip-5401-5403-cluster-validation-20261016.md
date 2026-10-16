@@ -35,7 +35,9 @@ The developer clarified that the intended agent path needs only a final response
 
 ## Local changes and cleanup
 
-The checked-in k0s profile and isolated fixture now pin the new image by digest. The fixture omits PLATFORM_URL. The reconciler only sets PLATFORM_URL when a model URL exists, and its focused deployment test asserts absence in cpuOnly. The synthetic adapter probe now uses the returned runtime_id. Focused Go tests, YAML parsing, and Git diff checks passed locally.
+The isolated fixture pins the new image by digest and omits PLATFORM_URL. The checked-in k0s profile remains LAS-only with its older operator pin; its proposed SLIM enablement and image override were removed after PR review. The reconciler sets PLATFORM_URL only when a model URL exists, and its focused deployment test asserts absence in cpuOnly. The synthetic adapter probe now uses the returned runtime_id. Focused Go tests, YAML parsing, and Git diff checks passed locally during this cluster retest.
+
+PR review follow-up: SLIM deployment configuration now accepts a model URL without an AgentRuntime feature, adds the LAS URL and graph ID only when AgentRuntime is configured, and rejects configurations with neither route. The current package builds locally; this follow-up was not redeployed or retested in the cluster.
 
 The isolated Deployment, Service, both ConfigMaps, and test-only pull Secret were deleted; a label query and direct Secret lookup returned no resources. The primary LAS and SLIM AIServices remained Ready=True with their original UIDs (39598b65-89e6-4b32-ba5b-547dc9902036 and 0acaaa07-59be-4428-8ba8-5fe7fa0392b8). Primary LAS API, LAS queue, and original SLIM Deployments remained 1/1 with their original images. The temporary loopback port-forwards ended with the probes, the private tunnel was stopped, and the exact temporary installer security-group rule sgr-0bb3a4d975e251b7b was revoked; readback returned NotFound. The short-lived Splunk interactive JWTs were held in memory only and will expire automatically. No bearer, password, private key, kubeconfig, or application credential bytes were printed or committed.
 

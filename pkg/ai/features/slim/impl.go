@@ -111,8 +111,8 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 	}
 
 	if ai.Spec.AIPlatformRef.Name == "" {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "AIPlatformRef.Name is required for the LAS caller route")
-		return fmt.Errorf("AIPlatformRef.Name is required for the LAS caller route")
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "AIPlatformRef.Name is required for SLIM configuration")
+		return fmt.Errorf("AIPlatformRef.Name is required for SLIM configuration")
 	}
 
 	aiPlatform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
@@ -139,6 +139,10 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 			ai.Spec.AIPlatformUrl = fmt.Sprintf("%s://%s.%s.svc.%s:8000",
 				scheme, aiPlatform.Status.RayServiceName, ai.Spec.AIPlatformRef.Namespace, clusterDomain)
 		}
+	}
+	if slimPlatformURL(ai.Spec.AIPlatformUrl) == "" && !platformHasFeature(aiPlatform, "agentruntime") {
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "SLIM requires AIPlatformUrl or an AgentRuntime-backed AgentServerUrl")
+		return fmt.Errorf("SLIM requires AIPlatformUrl or an AgentRuntime-backed AgentServerUrl")
 	}
 
 	if ai.Spec.Resources.Requests == nil {
@@ -189,6 +193,11 @@ func platformHasFeature(platform *aiv1.AIPlatform, name string) bool {
 		}
 	}
 	return false
+}
+
+func slimPlatformURL(raw string) string {
+	url := strings.TrimRight(strings.TrimSpace(raw), "/")
+	return strings.TrimSuffix(url, "/ai-platform-models/v1")
 }
 
 func (r *SlimReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.AIService) error {
@@ -265,9 +274,9 @@ func buildSplunkIssuersVal(ai *aiv1.AIService) string {
 //     from the AIService spec (CRRef → endpoint → trustedIssuers), matching saia.
 //   - SERVICE_NAME / SERVICE_INTERNAL_NAME identify the service.
 //
-// AGENT_SERVER_URL is injected on the Deployment and resolves to the stable
-// AgentRuntime Service owned by this AIPlatform. PLATFORM_URL remains the
-// separate model-serving endpoint when that service is present.
+// AGENT_SERVER_URL is injected on the Deployment when this AIPlatform has an
+// AgentRuntime feature. PLATFORM_URL is the separate model-serving endpoint
+// when AIPlatformUrl is set. SLIM needs at least one of these routes.
 func (r *SlimReconciler) reconcileSlimConfigMap(ctx context.Context, ai *aiv1.AIService) error {
 	cmName := fmt.Sprintf("%s-slim-config", ai.Name)
 
@@ -489,19 +498,27 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		{Name: "config-volume", MountPath: "/etc/config"},
 	}
 
-	agentServerURL, graphID, err := r.agentRuntimeTarget(ctx, ai)
+	aiPlatform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
 	if err != nil {
-		return err
+		return fmt.Errorf("fetching AIPlatform for SLIM route: %w", err)
 	}
 
-	env := []corev1.EnvVar{
-		{Name: "AGENT_SERVER_URL", Value: agentServerURL},
-		{Name: "LAS_GRAPH_ID", Value: graphID},
+	env := []corev1.EnvVar{}
+	if platformHasFeature(aiPlatform, "agentruntime") {
+		agentServerURL, graphID, err := r.agentRuntimeTarget(ctx, ai)
+		if err != nil {
+			return err
+		}
+		env = append(env,
+			corev1.EnvVar{Name: "AGENT_SERVER_URL", Value: agentServerURL},
+			corev1.EnvVar{Name: "LAS_GRAPH_ID", Value: graphID},
+		)
 	}
-	if ai.Spec.AIPlatformUrl != "" {
-		platformURL := strings.TrimRight(ai.Spec.AIPlatformUrl, "/")
-		platformURL = strings.TrimSuffix(platformURL, "/ai-platform-models/v1")
+	if platformURL := slimPlatformURL(ai.Spec.AIPlatformUrl); platformURL != "" {
 		env = append(env, corev1.EnvVar{Name: "PLATFORM_URL", Value: platformURL})
+	}
+	if len(env) == 0 {
+		return fmt.Errorf("SLIM requires AIPlatformUrl or an AgentRuntime-backed AgentServerUrl")
 	}
 
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {

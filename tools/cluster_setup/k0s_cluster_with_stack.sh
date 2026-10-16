@@ -4486,6 +4486,17 @@ EOF
   log "ECR repository permissions configured"
 }
 
+# Apply a dockerconfigjson Secret through stdin. The last-applied annotation
+# from older client-side installs is removed before rotation because it can
+# retain a copy of registry authentication data.
+apply_registry_secret() {
+  local ns="$1" name="$2" server="$3" username="$4" password="$5"
+  kubectl annotate secret "${name}" --namespace "${ns}" kubectl.kubernetes.io/last-applied-configuration- >/dev/null 2>&1 || true
+  printf '%s' "${password}" | python3 "$(dirname "${BASH_SOURCE[0]}")/las_deployment.py" \
+    registry-secret --namespace "${ns}" --name "${name}" --server "${server}" --username "${username}" \
+    | kubectl apply --server-side --force-conflicts --field-manager=splunk-ai-operator-deployment -f -
+}
+
 # ====== CREATE IMAGE PULL SECRETS FROM CONFIG ======
 create_image_pull_secrets() {
   local ns="$1"
@@ -4515,21 +4526,18 @@ create_image_pull_secrets() {
         log "Auto-detected ECR account: ${ecr_account}"
       fi
 
-      # Get ECR authorization token
-      local ecr_password
-      if ecr_password=$(aws ecr get-login-password --region "${ecr_region}" 2>/dev/null); then
-        # Create docker-registry secret
-        kubectl create secret docker-registry ecr-registry-secret \
-          --docker-server="${ecr_account}.dkr.ecr.${ecr_region}.amazonaws.com" \
-          --docker-username=AWS \
-          --docker-password="${ecr_password}" \
-          --namespace="${ns}" \
-          --dry-run=client -o yaml | kubectl apply -f -
-
+      # Stream the short-lived token through stdin; do not store it in a shell
+      # variable or expose it in argv. Remove any stale client-side apply copy.
+      kubectl annotate secret ecr-registry-secret --namespace "${ns}" kubectl.kubernetes.io/last-applied-configuration- >/dev/null 2>&1 || true
+      if aws ecr get-login-password --region "${ecr_region}" 2>/dev/null \
+        | python3 "$(dirname "${BASH_SOURCE[0]}")/las_deployment.py" \
+            registry-secret --namespace "${ns}" --name ecr-registry-secret \
+            --server "${ecr_account}.dkr.ecr.${ecr_region}.amazonaws.com" \
+        | kubectl apply --server-side --force-conflicts --field-manager=splunk-ai-operator-deployment -f -; then
         log "✓ ECR secret created: ecr-registry-secret"
         secrets_created+=("ecr-registry-secret")
       else
-        warn "Failed to get ECR token - skipping ECR secret"
+        warn "Failed to refresh ECR secret - skipping private ECR pulls"
       fi
     fi
   fi
@@ -4542,16 +4550,7 @@ create_image_pull_secrets() {
     local dh_email=$(yq eval '.imagePullSecrets.dockerHub.email' "${CONFIG_FILE}" 2>/dev/null)
 
     if [[ -n "${dh_username}" && -n "${dh_password}" ]]; then
-      local email_arg=""
-      [[ -n "${dh_email}" ]] && email_arg="--docker-email=${dh_email}"
-
-      kubectl create secret docker-registry docker-hub-secret \
-        --docker-server=docker.io \
-        --docker-username="${dh_username}" \
-        --docker-password="${dh_password}" \
-        ${email_arg} \
-        --namespace="${ns}" \
-        --dry-run=client -o yaml | kubectl apply -f -
+      apply_registry_secret "${ns}" docker-hub-secret docker.io "${dh_username}" "${dh_password}"
 
       log "✓ Docker Hub secret created: docker-hub-secret"
       secrets_created+=("docker-hub-secret")
@@ -4566,12 +4565,7 @@ create_image_pull_secrets() {
     local gcr_json_key=$(yq eval '.imagePullSecrets.gcr.jsonKey' "${CONFIG_FILE}" 2>/dev/null)
 
     if [[ -n "${gcr_json_key}" && "${gcr_json_key}" != "null" ]]; then
-      kubectl create secret docker-registry gcr-secret \
-        --docker-server=gcr.io \
-        --docker-username=_json_key \
-        --docker-password="${gcr_json_key}" \
-        --namespace="${ns}" \
-        --dry-run=client -o yaml | kubectl apply -f -
+      apply_registry_secret "${ns}" gcr-secret gcr.io _json_key "${gcr_json_key}"
 
       log "✓ GCR secret created: gcr-secret"
       secrets_created+=("gcr-secret")
@@ -4588,12 +4582,7 @@ create_image_pull_secrets() {
     local acr_password=$(yq eval '.imagePullSecrets.acr.password' "${CONFIG_FILE}" 2>/dev/null)
 
     if [[ -n "${acr_registry}" && -n "${acr_username}" && -n "${acr_password}" ]]; then
-      kubectl create secret docker-registry acr-secret \
-        --docker-server="${acr_registry}" \
-        --docker-username="${acr_username}" \
-        --docker-password="${acr_password}" \
-        --namespace="${ns}" \
-        --dry-run=client -o yaml | kubectl apply -f -
+      apply_registry_secret "${ns}" acr-secret "${acr_registry}" "${acr_username}" "${acr_password}"
 
       log "✓ ACR secret created: acr-secret"
       secrets_created+=("acr-secret")
@@ -4612,16 +4601,7 @@ create_image_pull_secrets() {
     local custom_email=$(yq eval '.imagePullSecrets.custom.email' "${CONFIG_FILE}" 2>/dev/null)
 
     if [[ -n "${custom_server}" && -n "${custom_username}" && -n "${custom_password}" ]]; then
-      local email_arg=""
-      [[ -n "${custom_email}" ]] && email_arg="--docker-email=${custom_email}"
-
-      kubectl create secret docker-registry "${custom_name}" \
-        --docker-server="${custom_server}" \
-        --docker-username="${custom_username}" \
-        --docker-password="${custom_password}" \
-        ${email_arg} \
-        --namespace="${ns}" \
-        --dry-run=client -o yaml | kubectl apply -f -
+      apply_registry_secret "${ns}" "${custom_name}" "${custom_server}" "${custom_username}" "${custom_password}"
 
       log "✓ Custom registry secret created: ${custom_name}"
       secrets_created+=("${custom_name}")
@@ -4672,22 +4652,19 @@ create_ecr_secret() {
   log "Prerequisite: ECR repository permissions must be configured beforehand"
   log "  Run: ./setup_ecr_permissions.sh to set up ECR access"
 
-  # Get ECR authorization token
-  log "Getting ECR authorization token for region ${region}..."
-  local ecr_password
-  if ! ecr_password=$(aws ecr get-login-password --region "${region}" 2>/dev/null); then
-    warn "Failed to get ECR token - skipping secret creation"
+  # Stream the short-lived token through stdin. Avoid shell variables and
+  # client-side apply annotations that would persist a copy of the token.
+  log "Refreshing ECR authorization in region ${region}..."
+  kubectl annotate secret ecr-registry-secret --namespace "${ns}" kubectl.kubernetes.io/last-applied-configuration- >/dev/null 2>&1 || true
+  if ! aws ecr get-login-password --region "${region}" 2>/dev/null \
+    | python3 "$(dirname "${BASH_SOURCE[0]}")/las_deployment.py" registry-secret \
+        --namespace "${ns}" --name ecr-registry-secret \
+        --server "${ecr_account}.dkr.ecr.${region}.amazonaws.com" \
+    | kubectl apply --server-side --force-conflicts --field-manager=splunk-ai-operator-deployment -f -; then
+    warn "Failed to refresh ECR credentials - skipping secret update"
     warn "Check AWS credentials and permissions"
     return 0
   fi
-
-  # Create docker-registry secret
-  kubectl create secret docker-registry ecr-registry-secret \
-    --docker-server="${ecr_account}.dkr.ecr.${region}.amazonaws.com" \
-    --docker-username=AWS \
-    --docker-password="${ecr_password}" \
-    --namespace="${ns}" \
-    --dry-run=client -o yaml | kubectl apply -f -
 
   log "✓ ECR secret created: ecr-registry-secret"
   log "✓ Secret will be referenced in AIPlatform CR spec.imagePullSecrets"
@@ -4842,6 +4819,37 @@ wait_for_splunk_standalone() {
 yaml_single_quote() {
   local value="${1//\'/\'\'}"
   printf "'%s'" "${value}"
+}
+
+# Queue HPA needs the resource metrics API. Keep installation usable when it is
+# absent, but report the exact prerequisite before the AIPlatform is applied.
+check_las_metrics_prerequisite() {
+  local config_file="$1" enabled
+  enabled=$(yq eval '.aiPlatform.features[] | select(.name == "agentruntime") | .las.queue.autoscaling.enabled // "false"' "${config_file}" 2>/dev/null | head -n 1 || echo "false")
+  [[ "${enabled}" == "true" ]] || return 0
+  if ! kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes >/dev/null 2>&1; then
+    warn "LAS queue autoscaling is enabled, but the Kubernetes resource metrics API is unavailable. Install/configure metrics-server; queue HPA scaling will not work until it is available."
+  fi
+}
+
+# Render only Secret references. Credential values remain in deployment-managed
+# Secrets and never enter the AIPlatform custom resource.
+render_las_secret_refs() {
+  local config_file="$1" feature_index="$2" managed="$3" references_json="$4"
+  local ref value rendered=""
+  for ref in licenseSecretRef postgresSecretRef redisSecretRef; do
+    if [[ "${managed}" == "true" ]]; then
+      case "${ref}" in
+        licenseSecretRef) value=$(jq -r '.licenseSecretRef' <<<"${references_json}") ;;
+        postgresSecretRef) value=$(jq -r '.postgresSecretRef' <<<"${references_json}") ;;
+        redisSecretRef) value=$(jq -r '.redisSecretRef' <<<"${references_json}") ;;
+      esac
+    else
+      value=$(yq eval ".aiPlatform.features[${feature_index}].${ref} // \"\"" "${config_file}" 2>/dev/null || echo "")
+    fi
+    [[ -n "${value}" && "${value}" != "null" ]] && rendered+="      ${ref}: \"${value}\""$'\n'
+  done
+  printf '%s' "${rendered}"
 }
 
 # Render only the allow-listed LAS custom-resource settings. Deployment-only
@@ -5106,8 +5114,31 @@ EOF
 
   # Build features YAML from config file (reads aiPlatform.features[] array)
   local features_yaml=""
-  local feature_count
+  local feature_count las_feature_index las_credentials_json las_credentials_managed
   feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
+  las_feature_index=""
+  local _feature_index=0
+  while [[ "${_feature_index}" -lt "${feature_count}" ]]; do
+    if [[ "$(yq eval ".aiPlatform.features[${_feature_index}].name // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")" == "agentruntime" ]]; then
+      las_feature_index="${_feature_index}"
+      break
+    fi
+    _feature_index=$((_feature_index + 1))
+  done
+  las_credentials_json='{"managed":false}'
+  las_credentials_managed="false"
+  if [[ -n "${las_feature_index}" ]]; then
+    local las_deployment_helper="$(dirname "${BASH_SOURCE[0]}")/las_deployment.py"
+    local aiplatform_resource_name="${CLUSTER_NAME}-ai-platform"
+    if ! las_credentials_json=$(python3 "${las_deployment_helper}" provision-secrets --config "${CONFIG_FILE}" --namespace "${AI_NS}" --platform "${aiplatform_resource_name}"); then
+      err "Could not provision LAS deployment credentials. No AIPlatform configuration was applied."
+    fi
+    las_credentials_managed=$(jq -r '.managed // false' <<<"${las_credentials_json}")
+    if ! python3 "${las_deployment_helper}" reconcile-egress --config "${CONFIG_FILE}" --namespace "${AI_NS}" --platform "${aiplatform_resource_name}"; then
+      err "Could not reconcile LAS egress policy. No AIPlatform configuration was applied."
+    fi
+    check_las_metrics_prerequisite "${CONFIG_FILE}"
+  fi
 
   if [[ "${feature_count}" -gt 0 ]]; then
     log "Reading ${feature_count} feature(s) from config..."
@@ -5126,10 +5157,11 @@ EOF
         features_yaml+="    - name: ${fname}"$'\n'
         features_yaml+="      version: \"${fver}\""$'\n'
         [[ -n "$fprovider" && "$fprovider" != "null" ]] && features_yaml+="      provider: \"${fprovider}\""$'\n'
-        for las_ref in licenseSecretRef postgresSecretRef redisSecretRef; do
-          las_value=$(yq eval ".aiPlatform.features[$i].${las_ref} // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
-          [[ -n "$las_value" && "$las_value" != "null" ]] && features_yaml+="      ${las_ref}: \"${las_value}\""$'\n'
-        done
+        if [[ "${fname}" == "agentruntime" ]]; then
+          features_yaml+="$(render_las_secret_refs "${CONFIG_FILE}" "$i" "${las_credentials_managed}" "${las_credentials_json}")"$'\n'
+        else
+          features_yaml+="$(render_las_secret_refs "${CONFIG_FILE}" "$i" false '{}')"$'\n'
+        fi
         if [[ "${fname}" == "agentruntime" ]]; then
           las_network_mode="connected"
           [[ "${AIRGAP_MODE:-false}" == "true" ]] && las_network_mode="airgapped"

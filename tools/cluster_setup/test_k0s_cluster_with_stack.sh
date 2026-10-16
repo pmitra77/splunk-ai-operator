@@ -93,6 +93,8 @@ _load_functions() {
   eval "$(_extract_fn validate_scale_factor_config)"
   eval "$(_extract_fn yaml_single_quote)"
   eval "$(_extract_fn render_las_feature_yaml)"
+  eval "$(_extract_fn render_las_secret_refs)"
+  eval "$(_extract_fn check_las_metrics_prerequisite)"
   eval "$(_extract_fn object_store_auth_looks_like_placeholder)"
   eval "$(_extract_fn _pod_is_healthy)"
   eval "$(_extract_fn _classify_pod_failure)"
@@ -144,6 +146,32 @@ assert_eq "raw LangSmith key is excluded" "0" "$(grep -c 'DO_NOT_RENDER_LANGSMIT
 } > "${_las_tmpdir}/rendered.yaml"
 assert_eq "rendered LAS feature is valid YAML" "airgapped" "$(yq eval -r '.spec.features[0].las.networkMode' "${_las_tmpdir}/rendered.yaml")"
 assert_eq "following feature field remains valid YAML" "fixture-sa" "$(yq eval -r '.spec.features[0].serviceAccountName' "${_las_tmpdir}/rendered.yaml")"
+_las_refs=$(render_las_secret_refs "${_las_tmpdir}/config.yaml" 0 true '{"managed":true,"licenseSecretRef":"las-auth-generated","postgresSecretRef":"las-postgres-generated","redisSecretRef":"las-redis-generated"}')
+assert_eq "managed license Secret reference replaces legacy ref" "1" "$(grep -c 'licenseSecretRef: \"las-auth-generated\"' <<<"${_las_refs}" || true)"
+assert_eq "managed dependency Secret references are rendered" "2" "$(grep -Ec 'SecretRef: \"las-(postgres|redis)-generated\"' <<<"${_las_refs}" || true)"
+assert_eq "managed Secret references never render credential values" "0" "$(grep -Ec 'DO_NOT_RENDER_POSTGRES_URL|DO_NOT_RENDER_LANGSMITH_KEY' <<<"${_las_refs}" || true)"
+{
+  printf 'spec:\n  features:\n    - name: agentruntime\n'
+  printf '%s' "${_las_refs}"$'\n'
+  printf '%s' "${_las_rendered}"$'\n'
+  printf '      serviceAccountName: fixture-sa\n'
+} > "${_las_tmpdir}/managed-rendered.yaml"
+assert_eq "managed credentials render as references in valid CR YAML" "las-postgres-generated" "$(yq eval -r '.spec.features[0].postgresSecretRef' "${_las_tmpdir}/managed-rendered.yaml")"
+_metric_config="${_las_tmpdir}/metrics.yaml"
+cat > "${_metric_config}" <<'YAML'
+aiPlatform:
+  features:
+    - name: agentruntime
+      las:
+        queue:
+          autoscaling:
+            enabled: true
+YAML
+_metric_warning=""
+warn() { _metric_warning="$*"; }
+kubectl() { return 1; }
+check_las_metrics_prerequisite "${_metric_config}"
+assert_eq "missing metrics API produces actionable queue autoscaling warning" "1" "$(grep -c 'Install/configure metrics-server' <<<"${_metric_warning}" || true)"
 rm -rf "${_las_tmpdir}"
 
 # ── Tests: build_image_url ─────────────────────────────────────────────────────

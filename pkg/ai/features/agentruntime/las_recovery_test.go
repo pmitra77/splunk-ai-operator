@@ -27,6 +27,7 @@ import (
 type fakeLASHelmActions struct {
 	current        *release.Release
 	history        []*release.Release
+	installErr     error
 	upgradeErr     error
 	upgradeCalls   int
 	installCalls   int
@@ -59,6 +60,9 @@ func (h *fakeLASHelmActions) History(string) ([]*release.Release, error) {
 
 func (h *fakeLASHelmActions) Install(_ context.Context, name string, ch *chart.Chart, values map[string]interface{}, _ bool, ownerUID string) (*release.Release, error) {
 	h.installCalls++
+	if h.installErr != nil {
+		return nil, h.installErr
+	}
 	h.current = testLASRelease(name, ownerUID, release.StatusDeployed, 1, time.Now())
 	h.current.Chart, h.current.Config = ch, values
 	return h.current, nil

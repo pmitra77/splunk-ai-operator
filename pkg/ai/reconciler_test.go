@@ -545,3 +545,38 @@ func TestCheckAIServiceStatus_RequiresCurrentLASReady(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckAIServiceStatusRecoversWhenLASBecomesReady(t *testing.T) {
+	scheme := buildTestScheme(t)
+	platform := &aiApi.AIPlatform{ObjectMeta: metav1.ObjectMeta{Name: "platform", Namespace: "default", UID: types.UID("platform-uid")}}
+	child := &aiApi.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "platform-agentruntime-mltk", Namespace: "default", Generation: 3},
+		Spec:       aiApi.AIServiceSpec{Feature: aiApi.FeatureSpec{Name: agentRuntimeFeatureName, LAS: &aiApi.LASFeatureSpec{}}},
+		Status: aiApi.AIServiceStatus{ObservedGeneration: 3, Conditions: []metav1.Condition{{
+			Type: "Ready", Status: metav1.ConditionFalse, Reason: "APIHealthCheckFailed", Message: "fixture health failure", ObservedGeneration: 3,
+		}}},
+	}
+	require.NoError(t, controllerutil.SetControllerReference(platform, child, scheme))
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&aiApi.AIService{}).
+		WithObjects(platform, child).
+		WithIndex(&aiApi.AIService{}, ownerKey, func(obj client.Object) []string {
+			if owner := metav1.GetControllerOfNoCopy(obj); owner != nil {
+				return []string{owner.Name}
+			}
+			return nil
+		}).Build()
+	reconciler := &AIPlatformReconciler{Client: fakeClient, Scheme: scheme}
+	ctx := context.Background()
+
+	require.ErrorContains(t, reconciler.CheckAIServiceStatus(ctx, platform), "LAS Ready condition is False")
+
+	updated := &aiApi.AIService{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(child), updated))
+	updated.Status.Conditions = []metav1.Condition{{
+		Type: "Ready", Status: metav1.ConditionTrue, Reason: "LASReady", Message: "fixture recovered", ObservedGeneration: 3,
+	}}
+	require.NoError(t, fakeClient.Status().Update(ctx, updated))
+	require.NoError(t, reconciler.CheckAIServiceStatus(ctx, platform))
+}

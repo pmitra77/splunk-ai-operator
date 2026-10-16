@@ -528,6 +528,7 @@ scp /mnt/transfer/airgap-bundle-<timestamp>.tar.gz \
 # Copy installer scripts (if not already on the machine)
 scp tools/cluster_setup/k0s_cluster_with_stack.sh \
     tools/cluster_setup/install_from_airgap_bundle.sh \
+    tools/cluster_setup/las_deployment.py \
     tools/cluster_setup/k0s-cluster-config.yaml \
     admin@install-machine:/opt/splunk-ai/
 

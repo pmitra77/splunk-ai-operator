@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - ai-tier-ga
+      - agent-runtime/ai-tier
   push:
     branches:
       - main
@@ -37,6 +38,7 @@ jobs:
     uses: ./.github/workflows/main-vulnerability-scan.yml
     secrets: inherit
     needs: build-image
+    if: github.event_name != 'pull_request'
 
   helm-lint-test:
     uses: ./.github/workflows/helm-lint-test.yml

@@ -233,3 +233,46 @@ func TestLASReconcileDisabledAutoscalingUsesOneFixedWorker(t *testing.T) {
 	require.Zero(t, helm.upgradeCalls)
 	require.Equal(t, "AutoscalingDisabled", meta.FindStatusCondition(ai.Status.Conditions, lasScalingReadyCondition).Reason)
 }
+
+func TestLASReconcileReadinessRecoversAfterUnusableEndpoint(t *testing.T) {
+	r, ai, _ := healthyLASReconcileFixture(t, 1, true, corev1.ConditionTrue)
+	ctx := context.Background()
+	name := agentRuntimeServiceName(ai.Name)
+	endpoints := &corev1.Endpoints{}
+	require.NoError(t, r.Get(ctx, client.ObjectKey{Namespace: ai.Namespace, Name: name}, endpoints))
+	endpoints.Subsets[0].Ports[0].Port = defaultAgentRuntimeTargetPort + 1
+	require.NoError(t, r.Update(ctx, endpoints))
+
+	require.ErrorContains(t, r.Reconcile(ctx, ai), "has no ready API endpoint")
+	ready := meta.FindStatusCondition(ai.Status.Conditions, "Ready")
+	require.NotNil(t, ready)
+	require.Equal(t, metav1.ConditionFalse, ready.Status)
+	require.Equal(t, "ServiceEndpointsNotReady", ready.Reason)
+
+	endpoints.Subsets[0].Ports[0].Port = defaultAgentRuntimeTargetPort
+	require.NoError(t, r.Update(ctx, endpoints))
+	require.NoError(t, r.Reconcile(ctx, ai))
+	ready = meta.FindStatusCondition(ai.Status.Conditions, "Ready")
+	require.NotNil(t, ready)
+	require.Equal(t, metav1.ConditionTrue, ready.Status)
+	require.Equal(t, "LASReady", ready.Reason)
+}
+
+func TestLASReconcileReadinessRecoversAfterAPIHealthFailure(t *testing.T) {
+	r, ai, _ := healthyLASReconcileFixture(t, 1, true, corev1.ConditionTrue)
+	r.healthClient = lasHealthClient(http.StatusServiceUnavailable)
+	ctx := context.Background()
+
+	require.ErrorContains(t, r.Reconcile(ctx, ai), "returned HTTP 503")
+	ready := meta.FindStatusCondition(ai.Status.Conditions, "Ready")
+	require.NotNil(t, ready)
+	require.Equal(t, metav1.ConditionFalse, ready.Status)
+	require.Equal(t, "APIHealthCheckFailed", ready.Reason)
+
+	r.healthClient = lasHealthClient(http.StatusOK)
+	require.NoError(t, r.Reconcile(ctx, ai))
+	ready = meta.FindStatusCondition(ai.Status.Conditions, "Ready")
+	require.NotNil(t, ready)
+	require.Equal(t, metav1.ConditionTrue, ready.Status)
+	require.Equal(t, "LASReady", ready.Reason)
+}

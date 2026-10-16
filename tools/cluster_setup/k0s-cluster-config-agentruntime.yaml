@@ -55,6 +55,8 @@ images:
     image: "docker.io/otel/opentelemetry-collector-contrib:0.122.1"
   nginx:
     image: "docker.io/library/nginx:1.27-alpine"
+  slim:
+    apiImage: "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:feature-las-202610151415-737694af1dc8@sha256:21fe592b894433a10fcf34b5a33900bec68f2ef8dd5cbcdeb3f1b0afa686f7b3"
 operators:
   ray:
     version: "v1.2.2"
@@ -89,7 +91,10 @@ splunk:
     endpoint: "https://splunk-webhook-compat.invalid:8088"
     secretName: "splunk-hec-compat"
   standaloneName: splunk-standalone
-  trustedIssuers: []
+  # The existing k0s test cluster issues CMP bearer tokens from this Splunk
+  # management Service. Keep it separate from the compatibility HEC endpoint.
+  trustedIssuers:
+    - "https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089"
 aiPlatform:
   name: "agentruntime-dev"
   defaultAcceleratorType: "L40S"
@@ -101,6 +106,8 @@ aiPlatform:
     otel: false
     prometheusOperator: false
   features:
+    - name: "slim"
+      version: "1.0.0"
     - name: "agentruntime"
       provider: "mltk"
       version: "0.1.0"

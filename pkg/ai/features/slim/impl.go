@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"reflect"
 	"sort"
@@ -37,6 +38,12 @@ type SlimReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 }
+
+const (
+	defaultAgentRuntimeHTTPPort int32 = 8080
+	maxDNSLabelLength                 = 63
+	unavailableModelPlatformURL       = "http://127.0.0.1:9"
+)
 
 func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
 	log := log.FromContext(ctx)
@@ -104,27 +111,28 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 		return fmt.Errorf("RELATED_IMAGE_SLIM_API must be set")
 	}
 
-	if ai.Spec.AIPlatformRef.Name == "" && ai.Spec.AIPlatformUrl == "" {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "AIPlatformRef.Name or AIPlatformUrl must be set")
-		return fmt.Errorf("either AIPlatformRef.Name or AIPlatformUrl must be set")
+	if ai.Spec.AIPlatformRef.Name == "" {
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "AIPlatformRef.Name is required for the LAS caller route")
+		return fmt.Errorf("AIPlatformRef.Name is required for the LAS caller route")
 	}
 
-	if ai.Spec.AIPlatformRef.Name != "" {
-		aiPlatform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
-		if err != nil {
-			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "fetching AIPlatform failed")
-			return fmt.Errorf("fetching AIPlatform: %w", err)
-		}
-
+	aiPlatform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
+	if err != nil {
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "fetching AIPlatform failed")
+		return fmt.Errorf("fetching AIPlatform: %w", err)
+	}
+	// Full-feature profiles include SAIA/model serving. CPU-only profiles omit
+	// it, so SLIM's route to LAS must not depend on a Ray endpoint in that mode.
+	// AIP-5576 owns the complete profile-aware readiness contract.
+	if platformHasFeature(aiPlatform, "saia") {
 		if err := r.validateAIPlatformReady(ctx, aiPlatform); err != nil {
-			return fmt.Errorf("AIPlatform infrastructure not ready: %w", err)
-		}
-
-		clusterDomain := ai.Spec.ClusterDomain
-		if clusterDomain == "" {
-			clusterDomain = "cluster.local"
+			return fmt.Errorf("AIPlatform model-serving infrastructure not ready: %w", err)
 		}
 		if ai.Spec.AIPlatformUrl == "" {
+			clusterDomain := ai.Spec.ClusterDomain
+			if clusterDomain == "" {
+				clusterDomain = "cluster.local"
+			}
 			scheme := ai.Spec.AIPlatformScheme
 			if scheme == "" {
 				scheme = "http"
@@ -132,11 +140,6 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 			ai.Spec.AIPlatformUrl = fmt.Sprintf("%s://%s.%s.svc.%s:8000",
 				scheme, aiPlatform.Status.RayServiceName, ai.Spec.AIPlatformRef.Namespace, clusterDomain)
 		}
-	}
-
-	if ai.Spec.AIPlatformUrl == "" {
-		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "AIPlatformUrl is not set")
-		return fmt.Errorf("AIPlatformUrl must be set (either from AIPlatformRef or explicitly)")
 	}
 
 	if ai.Spec.Resources.Requests == nil {
@@ -178,6 +181,15 @@ func (r *SlimReconciler) validateAIPlatformReady(ctx context.Context, aiPlatform
 		return fmt.Errorf("RayServiceName not populated in AIPlatform status")
 	}
 	return nil
+}
+
+func platformHasFeature(platform *aiv1.AIPlatform, name string) bool {
+	for _, feature := range platform.Spec.Features {
+		if feature.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *SlimReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.AIService) error {
@@ -249,14 +261,14 @@ func buildSplunkIssuersVal(ai *aiv1.AIService) string {
 // repo's `run-slim-aipod` Makefile target, trimmed to only those the service
 // actually reads in an in-cluster (non-SCS) deployment:
 //
-//   - DEPLOYMENT_TYPE=AITIER bypasses Vault/Consul/SCS auth in the entrypoint
-//     and flips the app to CMP (interactive-token) authorization.
+//   - DEPLOYMENT_TYPE=AITIER selects the AI Tier access integration.
 //   - SPLUNK_ISSUERS is the JWT issuer whitelist used by CMP auth; it is derived
 //     from the AIService spec (CRRef → endpoint → trustedIssuers), matching saia.
 //   - SERVICE_NAME / SERVICE_INTERNAL_NAME identify the service.
 //
-// PLATFORM_URL is injected on the Deployment (not here) because it is derived
-// per-AIService from the AIPlatform Ray endpoint.
+// AGENT_SERVER_URL is injected on the Deployment and resolves to the stable
+// AgentRuntime Service owned by this AIPlatform. PLATFORM_URL remains the
+// separate model-serving endpoint when that service is present.
 func (r *SlimReconciler) reconcileSlimConfigMap(ctx context.Context, ai *aiv1.AIService) error {
 	cmName := fmt.Sprintf("%s-slim-config", ai.Name)
 
@@ -267,7 +279,8 @@ func (r *SlimReconciler) reconcileSlimConfigMap(ctx context.Context, ai *aiv1.AI
 		"SERVICE_NAME":          "slim-api",
 		"SERVICE_INTERNAL_NAME": "SLIM",
 		"SPLUNK_ISSUERS":        splunkIssuersVal,
-		"ENABLE_AUTHZ":          "false",
+		"ENABLE_AUTHN":          "true",
+		"ENABLE_AUTHZ":          "true",
 		"API_VERSION":           "v1alpha1",
 	}
 
@@ -290,7 +303,7 @@ func (r *SlimReconciler) reconcileSlimConfigMap(ctx context.Context, ai *aiv1.AI
 	// All other keys use fill-if-missing to preserve manual overrides.
 	needsUpdate := false
 	for k, v := range defaults {
-		if k == "SPLUNK_ISSUERS" {
+		if k == "SPLUNK_ISSUERS" || k == "ENABLE_AUTHN" || k == "ENABLE_AUTHZ" {
 			if found.Data[k] != v {
 				found.Data[k] = v
 				needsUpdate = true
@@ -453,6 +466,10 @@ func (r *SlimReconciler) reconcileCertificate(ctx context.Context, ai *aiv1.AISe
 
 func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.AIService) error {
 	featureConfigName := fmt.Sprintf("splunk-%s-feature-config", ai.Name)
+	slimConfig := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{Name: ai.Name + "-slim-config", Namespace: ai.Namespace}, slimConfig); err != nil {
+		return fmt.Errorf("fetching Slim ConfigMap for Deployment rollout: %w", err)
+	}
 
 	volumes := []corev1.Volume{
 		{
@@ -473,18 +490,24 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		{Name: "config-volume", MountPath: "/etc/config"},
 	}
 
-	// slim-api (AITIER) expects PLATFORM_URL to be a fully-qualified URL
-	// pointing at the Ray head's serve root. Each model is mounted at its own
-	// top-level route prefix (e.g. /gemma4_31b_it), so slim-api builds
-	// {PLATFORM_URL}/{model}/... directly. The Entrypoint catch-all app
-	// (.../ai-platform-models/v1) requires a leading {tenant} segment and does
-	// not serve model traffic, so the suffix must NOT be present here.
-	platformURL := strings.TrimRight(ai.Spec.AIPlatformUrl, "/")
-	platformURL = strings.TrimSuffix(platformURL, "/ai-platform-models/v1")
+	agentServerURL, graphID, err := r.agentRuntimeTarget(ctx, ai)
+	if err != nil {
+		return err
+	}
 
 	env := []corev1.EnvVar{
-		{Name: "PLATFORM_URL", Value: platformURL},
+		{Name: "AGENT_SERVER_URL", Value: agentServerURL},
+		{Name: "LAS_GRAPH_ID", Value: graphID},
 	}
+	platformURL := unavailableModelPlatformURL
+	if ai.Spec.AIPlatformUrl != "" {
+		platformURL = strings.TrimRight(ai.Spec.AIPlatformUrl, "/")
+		platformURL = strings.TrimSuffix(platformURL, "/ai-platform-models/v1")
+	}
+	// The current SLIM image constructs its model router during import and
+	// refuses to start without PLATFORM_URL, including on LAS-only profiles.
+	// An unreachable loopback URL keeps model calls unavailable in that mode.
+	env = append(env, corev1.EnvVar{Name: "PLATFORM_URL", Value: platformURL})
 
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
 		volumes = append(volumes, corev1.Volume{
@@ -533,7 +556,8 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	}
 
 	// The issuers hash rolls the pods whenever the derived SPLUNK_ISSUERS value
-	// changes, so CMP auth picks up spec-driven issuer changes (matches saia).
+	// changes. The ConfigMap revision also rolls pods after any correction to
+	// authentication flags: environment variables do not change in running pods.
 	issuersVal := buildSplunkIssuersVal(ai)
 	issuersChecksum := fmt.Sprintf("%x", sha256.Sum256([]byte(issuersVal)))
 	annotations := map[string]string{
@@ -545,6 +569,7 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 	for k, v := range common.FilterPropagatedAnnotations(ai.Annotations) {
 		annotations[k] = v
 	}
+	annotations["splunk-ai-operator/slim-config-revision"] = string(slimConfig.UID) + "/" + slimConfig.ResourceVersion
 
 	if err := controllerutil.SetControllerReference(ai, deployment, r.Scheme); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on Deployment failed")
@@ -615,6 +640,63 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		return fmt.Errorf("create/update Deployment: %w", err)
 	}
 	return nil
+}
+
+func (r *SlimReconciler) agentRuntimeTarget(ctx context.Context, ai *aiv1.AIService) (string, string, error) {
+	platform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
+	if err != nil {
+		return "", "", fmt.Errorf("fetching AIPlatform for AgentRuntime route: %w", err)
+	}
+
+	var runtimeFeature *aiv1.FeatureSpec
+	for i := range platform.Spec.Features {
+		feature := &platform.Spec.Features[i]
+		if feature.Name != "agentruntime" {
+			continue
+		}
+		if runtimeFeature != nil {
+			return "", "", fmt.Errorf("AIPlatform %q has multiple AgentRuntime features; SLIM requires one selected LAS route", platform.Name)
+		}
+		runtimeFeature = feature
+	}
+	if runtimeFeature == nil {
+		return "", "", fmt.Errorf("AIPlatform %q has no AgentRuntime feature for the SLIM caller route", platform.Name)
+	}
+	if runtimeFeature.LAS == nil || runtimeFeature.LAS.AssistantID == "" {
+		return "", "", fmt.Errorf("AIPlatform %q AgentRuntime feature has no LAS assistantId for the SLIM caller route", platform.Name)
+	}
+
+	serviceBase := platform.Name + "-agentruntime"
+	if runtimeFeature.Provider != "" {
+		serviceBase += "-" + runtimeFeature.Provider
+		serviceBase = boundedDNSName(serviceBase)
+	}
+	serviceName := boundedServiceName(serviceBase)
+	clusterDomain := ai.Spec.ClusterDomain
+	if clusterDomain == "" {
+		clusterDomain = "cluster.local"
+	}
+	return fmt.Sprintf("http://%s.%s.svc.%s:%d", serviceName, platform.Namespace, clusterDomain, defaultAgentRuntimeHTTPPort), runtimeFeature.LAS.AssistantID, nil
+}
+
+func boundedDNSName(name string) string {
+	if len(name) <= maxDNSLabelLength {
+		return name
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name))
+	return strings.TrimRight(name[:maxDNSLabelLength-9], "-") + "-" + fmt.Sprintf("%08x", h.Sum32())
+}
+
+func boundedServiceName(aiServiceName string) string {
+	name := aiServiceName + "-svc"
+	if len(name) <= maxDNSLabelLength {
+		return name
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name))
+	baseLength := maxDNSLabelLength - len("svc") - 8 - 2
+	return strings.TrimRight(aiServiceName[:baseLength], "-") + "-" + fmt.Sprintf("%08x", h.Sum32()) + "-svc"
 }
 
 // reconcileSlimService ensures the public-facing Service, which may be exposed via

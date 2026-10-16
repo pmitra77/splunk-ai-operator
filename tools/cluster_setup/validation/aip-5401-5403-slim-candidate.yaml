@@ -1,0 +1,124 @@
+# Isolated AIP-5401/AIP-5403 route fixture for the agentruntime-dev test cluster.
+# Apply only after confirming the existing LAS stable Service and creating a
+# temporary aip5401-ecr-pull Secret from a fresh ECR token.
+# This workload has a unique name and is intentionally not owned by an AIService.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aip5401-slim-candidate-config
+  namespace: ai-platform
+  labels:
+    validation.splunk.com/story: aip-5401-5403
+data:
+  DEPLOYMENT_TYPE: AITIER
+  SERVICE_NAME: slim-api
+  SERVICE_INTERNAL_NAME: SLIM
+  SPLUNK_ISSUERS: https://splunk-splunk-standalone-standalone-service.ai-platform.svc.cluster.local:8089
+  ENABLE_AUTHN: "true"
+  ENABLE_AUTHZ: "true"
+  API_VERSION: v1alpha1
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aip5401-slim-candidate-feature-config
+  namespace: ai-platform
+  labels:
+    validation.splunk.com/story: aip-5401-5403
+data:
+  features_config.yaml: |
+    customization:
+      enabled_by_default: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aip5401-slim-candidate
+  namespace: ai-platform
+  labels:
+    validation.splunk.com/story: aip-5401-5403
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: aip5401-slim-candidate
+  template:
+    metadata:
+      labels:
+        app: aip5401-slim-candidate
+        validation.splunk.com/story: aip-5401-5403
+    spec:
+      imagePullSecrets:
+        - name: aip5401-ecr-pull
+      containers:
+        - name: slim-api
+          image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:feature-las-202610151415-737694af1dc8@sha256:21fe592b894433a10fcf34b5a33900bec68f2ef8dd5cbcdeb3f1b0afa686f7b3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 8088
+          envFrom:
+            - configMapRef:
+                name: aip5401-slim-candidate-config
+          env:
+            - name: AGENT_SERVER_URL
+              value: http://agentruntime-dev-ai-platform-agentruntime-mltk-svc.ai-platform.svc.cluster.local:8080
+            - name: LAS_GRAPH_ID
+              value: echo
+            # This image currently checks PLATFORM_URL while importing its model
+            # router, even when the LAS path does not use model serving. A loopback
+            # URL makes unsupported model calls fail locally in this fixture.
+            - name: PLATFORM_URL
+              value: http://127.0.0.1:9
+            - name: TLS_DISABLED
+              value: "true"
+          volumeMounts:
+            - name: feature-config
+              mountPath: /etc/config
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+      volumes:
+        - name: feature-config
+          configMap:
+            name: aip5401-slim-candidate-feature-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aip5401-slim-candidate
+  namespace: ai-platform
+  labels:
+    validation.splunk.com/story: aip-5401-5403
+spec:
+  type: ClusterIP
+  selector:
+    app: aip5401-slim-candidate
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

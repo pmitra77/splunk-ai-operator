@@ -23,5 +23,8 @@ jobs:
       - name: Run LAS deployment helper unit tests
         run: python3 tools/cluster_setup/test_las_deployment.py
 
+      - name: Run ECR refresh rollout tests
+        run: bash tools/cluster_setup/test_refresh_ecr_credentials.sh
+
       - name: Run Splunk-optional installer dry-run tests
         run: bash tools/cluster_setup/test_installer_dry_run.sh

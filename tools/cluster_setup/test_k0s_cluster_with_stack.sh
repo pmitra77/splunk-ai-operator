@@ -156,7 +156,7 @@ assert_eq "managed Secret references never render credential values" "0" "$(grep
   printf '%s' "${_las_rendered}"$'\n'
   printf '      serviceAccountName: fixture-sa\n'
 } > "${_las_tmpdir}/managed-rendered.yaml"
-assert_eq "managed credentials render as references in valid CR YAML" "fixture-postgres-generated" "$(yq eval -r '.spec.features[0].postgresSecretRef' "${_las_tmpdir}/managed-rendered.yaml")"
+assert_eq "managed credentials render as references in valid CR YAML" "las-postgres-generated" "$(yq eval -r '.spec.features[0].postgresSecretRef' "${_las_tmpdir}/managed-rendered.yaml")"
 _metric_config="${_las_tmpdir}/metrics.yaml"
 cat > "${_metric_config}" <<'YAML'
 aiPlatform:

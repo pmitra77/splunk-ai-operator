@@ -75,6 +75,10 @@ func TestLASReconcileDesiredConfigurationChangeUpgradesOnce(t *testing.T) {
 	initialVersion := helm.current.Version
 	ai.Spec.Feature.LAS.Image.Tag = "candidate-2"
 	ai.Generation++
+	// Keep the fake API server's stored AIService in sync with the desired
+	// update before reconciling it, as the real controller receives the new
+	// generation from the API server.
+	require.NoError(t, r.Update(context.Background(), ai))
 
 	require.NoError(t, r.Reconcile(context.Background(), ai))
 	require.Equal(t, 1, helm.upgradeCalls)

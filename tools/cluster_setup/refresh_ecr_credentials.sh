@@ -15,6 +15,7 @@ export KUBECTL
 
 info()  { echo "[INFO]  $*"; }
 error() { echo "[ERROR] $*" >&2; }
+failures=0
 
 # --- Step 1: Refresh the managed registry Secret in place. New/replacement
 # Pods read this Secret at pull time, so keep it present while the token rotates.
@@ -28,6 +29,7 @@ for ns in ${NAMESPACES}; do
     info "  ✓ ecr-registry-secret refreshed in ${ns}"
   else
     error "  Failed to refresh ecr-registry-secret in ${ns}"
+    failures=$((failures + 1))
   fi
 done
 
@@ -56,8 +58,18 @@ for ns in ${NAMESPACES}; do
     [[ -z "$dep" ]] && continue
     images=$($KUBECTL -n "${ns}" get deployment "${dep}" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null || "")
     if echo "$images" | grep -q "${ECR_ACCOUNT}" 2>/dev/null; then
-      $KUBECTL -n "${ns}" rollout restart deployment "${dep}" 2>/dev/null && \
-        info "  Restarted: ${dep}" || true
+      if ! $KUBECTL -n "${ns}" rollout restart deployment "${dep}"; then
+        error "  Failed to restart ${dep} in ${ns}"
+        failures=$((failures + 1))
+        continue
+      fi
+      info "  Restarted: ${dep}; waiting for replacement Pods to become ready"
+      if $KUBECTL -n "${ns}" rollout status deployment "${dep}" --timeout="${ROLLOUT_TIMEOUT:-300s}"; then
+        info "  Ready: ${dep} in ${ns}"
+      else
+        error "  Rollout failed for ${dep} in ${ns}; check image-pull events and registry credentials"
+        failures=$((failures + 1))
+      fi
     fi
   done
 done
@@ -70,3 +82,8 @@ info "  Namespaces: ${NAMESPACES}"
 info ""
 info "  Token expires in ~12 hours. Re-run this script to refresh."
 info "=========================================="
+
+if (( failures > 0 )); then
+  error "Credential refresh or Deployment rollout failed for ${failures} operation(s)."
+  exit 1
+fi

@@ -81,6 +81,35 @@ class LASDeploymentTests(unittest.TestCase):
         las.provision_secrets(self.config, self.namespace, self.platform, self.runner)
         self.assertEqual(applies, len([call for call in self.runner.calls if call[0][0] == "apply"]))
 
+    def test_changed_credentials_update_owned_secrets_in_place(self):
+        references = las.provision_secrets(self.config, self.namespace, self.platform, self.runner)
+        secret_names = dict(references)
+        applies_before_rotation = len([call for call in self.runner.calls if call[0][0] == "apply"])
+        credentials = self.config["aiPlatform"]["features"][0]["las"]["credentials"]
+        credentials["licenseKey"] = "rotated-fixture-license"
+        credentials["postgresUri"] = "postgresql://rotated-user:rotated-password@postgres.internal/db"
+        credentials["redisUri"] = "rediss://rotated-user:rotated-password@redis.internal/0"
+        credentials["langsmithApiKey"] = "rotated-fixture-api-key"
+
+        rotated_references = las.provision_secrets(self.config, self.namespace, self.platform, self.runner)
+
+        self.assertEqual(secret_names, rotated_references)
+        self.assertEqual(
+            applies_before_rotation + 3,
+            len([call for call in self.runner.calls if call[0][0] == "apply"]),
+        )
+        expected = {
+            references["licenseSecretRef"]: {"langgraph_cloud_license_key": "rotated-fixture-license", "api_key": "rotated-fixture-api-key"},
+            references["postgresSecretRef"]: {"postgres_connection_url": credentials["postgresUri"]},
+            references["redisSecretRef"]: {"redis_connection_url": credentials["redisUri"]},
+        }
+        for name, values in expected.items():
+            secret = self.runner.resources[("secret", self.namespace, name)]
+            self.assertEqual(
+                {key: base64.b64encode(value.encode()).decode() for key, value in values.items()},
+                secret["data"],
+            )
+
     def test_removed_optional_api_key_is_removed_from_owned_auth_secret(self):
         references = las.provision_secrets(self.config, self.namespace, self.platform, self.runner)
         self.config["aiPlatform"]["features"][0]["las"]["credentials"].pop("langsmithApiKey")
@@ -176,6 +205,28 @@ class LASDeploymentTests(unittest.TestCase):
         policy = next(value for value in self.runner.resources.values() if value["kind"] == "NetworkPolicy")
         ip_blocks = [rule["to"][0]["ipBlock"]["cidr"] for rule in policy["spec"]["egress"] if "ipBlock" in rule["to"][0]]
         self.assertEqual(["10.0.0.2/32"], ip_blocks)
+
+    def test_unchanged_allowlist_is_a_noop(self):
+        config = {"cluster": {"egress": {"allowedIPs": ["10.0.0.1"]}}}
+        config["aiPlatform"] = self.config["aiPlatform"]
+        las.reconcile_egress_policy(config, self.namespace, self.platform, self.runner)
+        applies = len([call for call in self.runner.calls if call[0][0] == "apply"])
+        las.reconcile_egress_policy(config, self.namespace, self.platform, self.runner)
+        self.assertEqual(applies, len([call for call in self.runner.calls if call[0][0] == "apply"]))
+
+    def test_foreign_network_policy_is_not_adopted_or_deleted(self):
+        config = {"cluster": {"egress": {"allowedIPs": ["10.0.0.1"]}}}
+        config["aiPlatform"] = self.config["aiPlatform"]
+        desired = las.network_policy_manifest(
+            self.namespace, self.platform, "agentruntime", "mltk", ["10.0.0.1/32"]
+        )
+        name = desired["metadata"]["name"]
+        desired["metadata"]["labels"]["app.kubernetes.io/managed-by"] = "someone-else"
+        self.runner.resources[("networkpolicy", self.namespace, name)] = desired
+
+        with self.assertRaisesRegex(RuntimeError, "foreign LAS egress NetworkPolicy"):
+            las.reconcile_egress_policy(config, self.namespace, self.platform, self.runner)
+        self.assertEqual(0, len([call for call in self.runner.calls if call[0][0] in {"apply", "delete"}]))
 
     def test_omitted_allowlist_removes_only_the_owned_policy(self):
         configured = dict(self.config)

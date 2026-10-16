@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - ai-tier-ga
+      - agent-runtime/ai-tier
   push:
     branches:
       - main

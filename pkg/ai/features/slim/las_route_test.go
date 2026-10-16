@@ -85,7 +85,7 @@ func TestSlimDeploymentSeparatesLASAndModelEndpoints(t *testing.T) {
 		modelURL     string
 		wantModelURL string
 	}{
-		{name: "cpu-only", wantModelURL: unavailableModelPlatformURL},
+		{name: "cpu-only"},
 		{name: "with-model-serving", modelURL: "http://ray.ai-platform.svc.cluster.local:8000/ai-platform-models/v1", wantModelURL: "http://ray.ai-platform.svc.cluster.local:8000"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -109,7 +109,11 @@ func TestSlimDeploymentSeparatesLASAndModelEndpoints(t *testing.T) {
 			}
 			assert.Equal(t, "http://launchpad-agentruntime-mltk-svc.ai-platform.svc.cluster.local:8080", env["AGENT_SERVER_URL"])
 			assert.Equal(t, "echo", env["LAS_GRAPH_ID"])
-			assert.Equal(t, tc.wantModelURL, env["PLATFORM_URL"])
+			if tc.wantModelURL == "" {
+				assert.NotContains(t, env, "PLATFORM_URL")
+			} else {
+				assert.Equal(t, tc.wantModelURL, env["PLATFORM_URL"])
+			}
 		})
 	}
 }

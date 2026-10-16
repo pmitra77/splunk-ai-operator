@@ -42,7 +42,6 @@ type SlimReconciler struct {
 const (
 	defaultAgentRuntimeHTTPPort int32 = 8080
 	maxDNSLabelLength                 = 63
-	unavailableModelPlatformURL       = "http://127.0.0.1:9"
 )
 
 func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
@@ -499,15 +498,11 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		{Name: "AGENT_SERVER_URL", Value: agentServerURL},
 		{Name: "LAS_GRAPH_ID", Value: graphID},
 	}
-	platformURL := unavailableModelPlatformURL
 	if ai.Spec.AIPlatformUrl != "" {
-		platformURL = strings.TrimRight(ai.Spec.AIPlatformUrl, "/")
+		platformURL := strings.TrimRight(ai.Spec.AIPlatformUrl, "/")
 		platformURL = strings.TrimSuffix(platformURL, "/ai-platform-models/v1")
+		env = append(env, corev1.EnvVar{Name: "PLATFORM_URL", Value: platformURL})
 	}
-	// The current SLIM image constructs its model router during import and
-	// refuses to start without PLATFORM_URL, including on LAS-only profiles.
-	// An unreachable loopback URL keeps model calls unavailable in that mode.
-	env = append(env, corev1.EnvVar{Name: "PLATFORM_URL", Value: platformURL})
 
 	if ai.Spec.MTLS.Enabled && ai.Spec.MTLS.Termination == "operator" {
 		volumes = append(volumes, corev1.Volume{

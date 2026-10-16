@@ -56,7 +56,7 @@ images:
   nginx:
     image: "docker.io/library/nginx:1.27-alpine"
   slim:
-    apiImage: "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:feature-las-202610151415-737694af1dc8@sha256:21fe592b894433a10fcf34b5a33900bec68f2ef8dd5cbcdeb3f1b0afa686f7b3"
+    apiImage: "658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:feature-las-202610152102-b7cb6e97e381@sha256:951ac687c0753399e9a636cd507ec541f55ecaade4717c19276d228115c003ef"
 operators:
   ray:
     version: "v1.2.2"

@@ -54,7 +54,7 @@ spec:
         - name: aip5401-ecr-pull
       containers:
         - name: slim-api
-          image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:feature-las-202610151415-737694af1dc8@sha256:21fe592b894433a10fcf34b5a33900bec68f2ef8dd5cbcdeb3f1b0afa686f7b3
+          image: 658391232643.dkr.ecr.us-west-2.amazonaws.com/ml-platform/slim-api:feature-las-202610152102-b7cb6e97e381@sha256:951ac687c0753399e9a636cd507ec541f55ecaade4717c19276d228115c003ef
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -69,11 +69,6 @@ spec:
               value: http://agentruntime-dev-ai-platform-agentruntime-mltk-svc.ai-platform.svc.cluster.local:8080
             - name: LAS_GRAPH_ID
               value: echo
-            # This image currently checks PLATFORM_URL while importing its model
-            # router, even when the LAS path does not use model serving. A loopback
-            # URL makes unsupported model calls fail locally in this fixture.
-            - name: PLATFORM_URL
-              value: http://127.0.0.1:9
             - name: TLS_DISABLED
               value: "true"
           volumeMounts:

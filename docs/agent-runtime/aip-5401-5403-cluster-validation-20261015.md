@@ -2,6 +2,8 @@
 
 **Status:** Validation completed with blocking contract failures; neither story is accepted. This record separates observed cluster and HTTP results from source inspection and local tests. The isolated deployment and temporary access were cleaned up.
 
+**Follow-up:** The [October 16 retest](aip-5401-5403-cluster-validation-20261016.md) uses the updated SLIM image and supersedes the image-specific blocker status here.
+
 ## Scope and contract
 
 - Stories: [AIP-5401](https://splunk.atlassian.net/browse/AIP-5401), the single-product AITK/SLIM-to-LAS caller route; and [AIP-5403](https://splunk.atlassian.net/browse/AIP-5403), production caller access. Both were **In Progress** when refreshed for this work. Their implementation and checks are being handled together on `feat/AIP-5401-5403` from `agent-runtime/ai-tier` commit `59a28dad3a5a98398846167f1e5c5237b4c2acf1`.

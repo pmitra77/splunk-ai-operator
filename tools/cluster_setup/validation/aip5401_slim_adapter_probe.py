@@ -17,7 +17,7 @@ from slim_api.routers.las_agent import create_agent, delete_agent, invoke_agent
 async def main():
     marker = uuid.uuid4().hex[:12]
     name = f"aip5401probe{marker}"
-    assistant_id = f"aitier:{name}"
+    assistant_id = None
     session_id = f"aip5401probe{marker}"
     request = SimpleNamespace(headers={"request_id": f"aip5401-{marker}"})
     created = False
@@ -31,6 +31,9 @@ async def main():
         print(json.dumps({"step": "create", "status": response.status_code, "body": create_body}))
         if response.status_code != 201:
             return
+        assistant_id = create_body.get("runtime_id")
+        if not assistant_id:
+            raise RuntimeError("SLIM create response did not include runtime_id")
         created = True
         payload = {
             "agent_id": assistant_id,

@@ -73,7 +73,7 @@ class LASDeploymentTests(unittest.TestCase):
         for secret_value in self.config["aiPlatform"]["features"][0]["las"]["credentials"].values():
             self.assertNotIn(secret_value, serialized)
         self.assertEqual(3, len([call for call in self.runner.calls if call[0][0] == "apply"]))
-        self.assertTrue(all(len(name) <= 63 for name in references.values() if name != "managed"))
+        self.assertTrue(all(len(name) <= 63 for key, name in references.items() if key != "managed"))
 
     def test_unchanged_reapply_does_not_update_secrets(self):
         las.provision_secrets(self.config, self.namespace, self.platform, self.runner)
@@ -177,8 +177,10 @@ class LASDeploymentTests(unittest.TestCase):
         self.assertEqual(1, len(policies))
         policy = policies[0]
         expression = policy["spec"]["podSelector"]["matchExpressions"][0]
+        release = las._release_name(las._ai_service_name(self.platform, "agentruntime", "mltk"))
+        fullname = f"{release}-langgraph-cloud"
         self.assertEqual(
-            ["las-example-ai-platform-agentruntime-mltk-langgraph-cloud-api-server", "las-example-ai-platform-agentruntime-mltk-langgraph-cloud-queue"],
+            [f"{fullname}-api-server", f"{fullname}-queue"],
             expression["values"],
         )
         ip_blocks = [rule["to"][0]["ipBlock"]["cidr"] for rule in policy["spec"]["egress"] if "ipBlock" in rule["to"][0]]
@@ -186,7 +188,7 @@ class LASDeploymentTests(unittest.TestCase):
 
     def test_invalid_and_catch_all_egress_entries_are_rejected(self):
         self.config["cluster"] = {"egress": {"allowedIPs": ["not-an-ip"]}}
-        with self.assertRaisesRegex(ValueError, "allowedIPs\[0\]"):
+        with self.assertRaisesRegex(ValueError, r"allowedIPs\[0\]"):
             las.reconcile_egress_policy(self.config, self.namespace, self.platform, self.runner)
         self.config["cluster"]["egress"]["allowedIPs"] = ["0.0.0.0/0"]
         with self.assertRaisesRegex(ValueError, "catch-all"):

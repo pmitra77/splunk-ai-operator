@@ -297,58 +297,6 @@ kubectl get certificates -n splunk-ai-operator-system
 
 ---
 
-## LAS deployment credentials and egress
-
-For k0s deployments, put LAS deployment credentials under the AgentRuntime
-feature in the deployment configuration file. The installer validates the
-required PostgreSQL URI, Redis URI and license key, creates three namespace
-Secrets, then applies the AIPlatform with only their generated Secret names.
-`langsmithApiKey` is optional. Do not put real credentials in checked-in sample
-files or generated AIPlatform YAML. Keep populated deployment files private.
-
-```yaml
-cluster:
-  egress:
-    allowedIPs:
-      - "10.20.30.40" # Approved external MCP destination, if needed
-aiPlatform:
-  name: product-ai-tier
-  features:
-    - name: agentruntime
-      provider: mltk
-      las:
-        credentials:
-          licenseKey: "REPLACE_WITH_LICENSE_KEY"
-          postgresUri: "postgresql://USER:PASSWORD@postgres.internal:5432/las"
-          redisUri: "rediss://USER:PASSWORD@redis.internal:6379/0"
-          # Optional, only if LAS tracing needs LangSmith access.
-          langsmithApiKey: "REPLACE_WITH_LANGSMITH_API_KEY"
-```
-
-Reapplying the same file leaves unchanged Secrets untouched. Reapplying changed
-credentials updates the managed Secrets before the AIPlatform references are
-applied; removing the optional LangSmith key removes its Secret data key. The
-installer refuses to overwrite same-name Secrets it does not own. Deleting an
-AIService or Helm release retains these deployment-managed Secrets.
-
-When `cluster.egress.allowedIPs` is present, the installer manages a NetworkPolicy
-for the LAS API and queue Pods. It permits in-cluster Pod traffic, cluster DNS,
-and the listed destination IPs/CIDRs; plain IPs are normalized to host CIDRs and
-catch-all routes are rejected. An empty list permits only the internal baseline.
-Omitting the field removes only the matching policy managed by this deployment
-and keeps the prior unrestricted behavior. This policy does not replace upstream
-firewall rules or Splunk stack ingress controls. The cluster must have a network
-plugin that enforces NetworkPolicies.
-
-If queue autoscaling is enabled and the Kubernetes resource metrics API is not
-available, installation reports that metrics-server is needed; the LAS release
-can still install, but the queue HPA cannot scale until metrics are available.
-To refresh ECR image-pull credentials in place, run
-`tools/cluster_setup/refresh_ecr_credentials.sh` with AWS ECR authorization
-available to the installer. Replacement Pods then use the refreshed Secret.
-
----
-
 ## Upgrading
 
 ### Upgrade Operator

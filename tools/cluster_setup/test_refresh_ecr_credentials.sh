@@ -17,7 +17,11 @@ cat > "$WORK_DIR/bin/kubectl-stub" <<'SH'
 set -Eeuo pipefail
 args="$*"
 if [[ "$1" == "annotate" ]]; then exit 0; fi
-if [[ "$1" == "apply" ]]; then cat >/dev/null; exit 0; fi
+if [[ "$1" == "apply" ]]; then
+  cat >/dev/null
+  [[ "${KUBECTL_STUB_FAIL_APPLY:-false}" == "true" ]] && exit 1
+  exit 0
+fi
 if [[ "$1" == "-n" && "$3" == "get" ]]; then
   case "$4" in
     pods) printf 'NAME READY STATUS\nlas-api-0 1/1 Running\n'; exit 0 ;;
@@ -63,4 +67,14 @@ if KUBECTL_STUB_FAIL_ROLLOUT=true run_refresh; then
   exit 1
 fi
 grep -q 'Rollout failed' "$WORK_DIR/output.log"
+
+if KUBECTL_STUB_FAIL_APPLY=true run_refresh; then
+  printf 'Expected a failed Secret apply to fail the ECR refresh command.\n' >&2
+  exit 1
+fi
+grep -q 'no Pods were restarted' "$WORK_DIR/output.log"
+if grep -Eq 'Cleaning up ImagePullBackOff pods|Restarted:' "$WORK_DIR/output.log"; then
+  printf 'Pods were touched after the ECR Secret refresh failed.\n' >&2
+  exit 1
+fi
 printf 'ECR credential refresh rollout checks passed.\n'

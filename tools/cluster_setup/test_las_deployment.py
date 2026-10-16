@@ -195,6 +195,26 @@ class LASDeploymentTests(unittest.TestCase):
             las.reconcile_egress_policy(self.config, self.namespace, self.platform, self.runner)
         self.assertEqual([], self.runner.calls)
 
+    def test_malformed_egress_objects_are_rejected_without_removing_policy(self):
+        config = {"cluster": {"egress": {"allowedIPs": ["10.0.0.1"]}}}
+        config["aiPlatform"] = self.config["aiPlatform"]
+        las.reconcile_egress_policy(config, self.namespace, self.platform, self.runner)
+        original_policy = next(value for value in self.runner.resources.values() if value["kind"] == "NetworkPolicy")
+        malformed_values = [
+            ("cluster", []),
+            ("cluster", "invalid"),
+            ("cluster", {"egress": []}),
+            ("cluster", {"egress": "invalid"}),
+            ("cluster", {"egress": {"allowedIPs": None}}),
+        ]
+        for key, value in malformed_values:
+            invalid = dict(config)
+            invalid[key] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                las.reconcile_egress_policy(invalid, self.namespace, self.platform, self.runner)
+        policy = next(value for value in self.runner.resources.values() if value["kind"] == "NetworkPolicy")
+        self.assertEqual(original_policy, policy)
+
     def test_allowlist_update_reconciles_owned_policy(self):
         config = {"cluster": {"egress": {"allowedIPs": ["10.0.0.1"]}}}
         config["aiPlatform"] = self.config["aiPlatform"]
@@ -239,11 +259,13 @@ class LASDeploymentTests(unittest.TestCase):
 
     def test_registry_secret_manifest_has_durable_docker_auth_without_apply_annotation(self):
         manifest = las.registry_secret_manifest(
-            self.namespace, "ecr-registry-secret", "123456789012.dkr.ecr.us-west-2.amazonaws.com", "AWS", "fixture-token"
+            self.namespace, "ecr-registry-secret", "123456789012.dkr.ecr.us-west-2.amazonaws.com", "AWS", "fixture-token\r\n"
         )
         self.assertEqual("kubernetes.io/dockerconfigjson", manifest["type"])
         docker_config = json.loads(base64.b64decode(manifest["data"][".dockerconfigjson"]))
         self.assertEqual("fixture-token", docker_config["auths"]["123456789012.dkr.ecr.us-west-2.amazonaws.com"]["password"])
+        auth = docker_config["auths"]["123456789012.dkr.ecr.us-west-2.amazonaws.com"]["auth"]
+        self.assertEqual("AWS:fixture-token", base64.b64decode(auth).decode())
         self.assertNotIn("last-applied-configuration", manifest["metadata"].get("annotations", {}))
         self.assertNotIn("fixture-token", json.dumps({k: v for k, v in manifest.items() if k != "data"}))
 

@@ -33,6 +33,11 @@ for ns in ${NAMESPACES}; do
   fi
 done
 
+if (( failures > 0 )); then
+  error "ECR credential refresh failed in ${failures} namespace(s); no Pods were restarted."
+  exit 1
+fi
+
 # --- Step 2: Delete pods stuck in ImagePullBackOff ---
 info "Cleaning up ImagePullBackOff pods..."
 for ns in ${NAMESPACES}; do

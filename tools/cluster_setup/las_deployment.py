@@ -248,13 +248,19 @@ def provision_secrets(
 
 
 def _normalize_allowed_ips(config: dict[str, Any]) -> list[str] | None:
-    cluster = config.get("cluster", {})
-    egress = cluster.get("egress", {}) if isinstance(cluster, dict) else {}
-    if not isinstance(egress, dict) or "allowedIPs" not in egress:
+    if "cluster" not in config:
+        return None
+    cluster = config["cluster"]
+    if not isinstance(cluster, dict):
+        raise ValueError("cluster must be a mapping")
+    if "egress" not in cluster:
+        return None
+    egress = cluster["egress"]
+    if not isinstance(egress, dict):
+        raise ValueError("cluster.egress must be a mapping")
+    if "allowedIPs" not in egress:
         return None
     raw = egress["allowedIPs"]
-    if raw is None:
-        return None
     if not isinstance(raw, list):
         raise ValueError("cluster.egress.allowedIPs must be a list")
     networks: set[ipaddress.IPv4Network | ipaddress.IPv6Network] = set()
@@ -409,6 +415,11 @@ def reconcile_egress_policy(
 
 
 def registry_secret_manifest(namespace: str, name: str, server: str, username: str, token: str) -> dict[str, Any]:
+    # AWS CLI prints the token followed by a line delimiter. Docker's
+    # --password-stdin removes it; normalize here before encoding the Secret.
+    token = token.rstrip("\r\n")
+    if not token:
+        raise ValueError("registry token is empty")
     auth = base64.b64encode(f"{username}:{token}".encode()).decode()
     config = {"auths": {server: {"username": username, "password": token, "auth": auth}}}
     docker_config = json.dumps(config, separators=(",", ":")).encode()

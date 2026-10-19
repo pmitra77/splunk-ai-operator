@@ -55,9 +55,31 @@ def strings(value: Any):
 
 def assert_markers_absent(value: Any, markers: list[str], source: str) -> None:
     haystack = "\n".join(strings(value))
-    leaked = [name for name, marker in enumerate(markers) if marker in haystack]
+    leaked = [index for index, marker in enumerate(markers) if marker in haystack]
     if leaked:
         raise AssertionError(f"fake credential marker(s) found in {source}")
+
+
+async def checkpoint_history(client: Any, thread_id: str) -> list[Any]:
+    """Return every paginated state snapshot for a thread."""
+    snapshots = []
+    before = None
+    seen_cursors = set()
+    page_size = 100
+    while True:
+        page = await client.threads.get_history(thread_id, limit=page_size, before=before)
+        if not page:
+            return snapshots
+        normalized = [jsonable(state) for state in page]
+        snapshots.extend(normalized)
+        if len(page) < page_size:
+            return snapshots
+        checkpoint = normalized[-1].get("checkpoint", {})
+        cursor = checkpoint.get("checkpoint_id") if isinstance(checkpoint, dict) else None
+        if not cursor or cursor in seen_cursors:
+            raise AssertionError("could not advance through complete thread checkpoint history")
+        seen_cursors.add(cursor)
+        before = checkpoint
 
 
 def parse_chunks(chunks: list[Any]) -> list[Any]:
@@ -158,8 +180,15 @@ async def main():
         run_prompt = f"AIP5402_RUN_{marker}"
         run_context = {
             "llm": {"model": f"aip5402-model-{marker}", "api_key": fake_credentials[0]},
-            "mcps": [{"name": "fixture", "headers": {"Authorization": f"Bearer {fake_credentials[1]}"}}],
-            "knowledge_bases": [{"name": "fixture", "token": fake_credentials[2]}],
+            "mcps": [
+                {
+                    "name": f"aip5402-run-mcp-{marker}",
+                    "headers": {"Authorization": f"Bearer {fake_credentials[1]}"},
+                }
+            ],
+            "knowledge_bases": [
+                {"name": f"aip5402-run-kb-{marker}", "token": fake_credentials[2]}
+            ],
         }
         run_payload = {
             "agent_id": assistant_id,
@@ -185,7 +214,12 @@ async def main():
         run_summary = run_values.get("context_summary", {})
         if run_summary.get("llm_model") != run_context["llm"]["model"]:
             raise AssertionError("caller run did not forward the invocation's model context")
-        assert_markers_absent(run_state, fake_credentials, "caller run checkpoint")
+        if run_summary.get("mcp_names") != [run_context["mcps"][0]["name"]]:
+            raise AssertionError("caller run did not forward the invocation's MCP context")
+        if run_summary.get("kb_names") != [run_context["knowledge_bases"][0]["name"]]:
+            raise AssertionError("caller run did not forward the invocation's KB context")
+        run_history = await checkpoint_history(client, run_session)
+        assert_markers_absent(run_history, fake_credentials, "caller run checkpoint history")
         checks.extend(("caller_run_context_forwarding", "run_result_and_checkpoint_redaction"))
 
         resume_session = str(uuid.uuid4())
@@ -221,8 +255,15 @@ async def main():
             "system_prompt": "Complete the deterministic fixture.",
             "agent_timeout": 30,
             "llm": {"model": f"aip5402-resume-model-{marker}", "api_key": resume_credentials[0]},
-            "mcps": [{"name": "fixture", "headers": {"Authorization": f"Bearer {resume_credentials[1]}"}}],
-            "knowledge_bases": [{"name": "fixture", "token": resume_credentials[2]}],
+            "mcps": [
+                {
+                    "name": f"aip5402-resume-mcp-{marker}",
+                    "headers": {"Authorization": f"Bearer {resume_credentials[1]}"},
+                }
+            ],
+            "knowledge_bases": [
+                {"name": f"aip5402-resume-kb-{marker}", "token": resume_credentials[2]}
+            ],
         }
         status, resume_lines, captured, media_type = await invoke_once(
             tenant, resume_payload, f"{REQUEST_ID_PREFIX}{marker[:12]}-resume"
@@ -239,7 +280,12 @@ async def main():
         resume_summary = resume_values.get("context_summary", {})
         if resume_summary.get("llm_model") != resume_payload["llm"]["model"]:
             raise AssertionError("caller resume did not replace context with fresh invocation values")
-        assert_markers_absent(resume_state, fake_credentials + resume_credentials, "resume checkpoint")
+        if resume_summary.get("mcp_names") != [resume_payload["mcps"][0]["name"]]:
+            raise AssertionError("caller resume did not replace MCP context with fresh invocation values")
+        if resume_summary.get("kb_names") != [resume_payload["knowledge_bases"][0]["name"]]:
+            raise AssertionError("caller resume did not replace KB context with fresh invocation values")
+        resume_history = await checkpoint_history(client, resume_session)
+        assert_markers_absent(resume_history, fake_credentials + resume_credentials, "resume checkpoint history")
         checks.extend(("caller_resume_context_forwarding", "resume_result_and_checkpoint_redaction"))
 
         # A malformed body must fail safely and must not create a run.
@@ -258,10 +304,13 @@ async def main():
         if not invalid_rejected:
             raise AssertionError("caller route accepted malformed JSON")
         checks.append("malformed_payload_rejected")
-        print(json.dumps({"result": "PASS", "checks": checks}, sort_keys=True))
     finally:
         if assistant_id:
-            await delete_agent(tenant, assistant_id, request)
+            deleted = await delete_agent(tenant, assistant_id, request)
+            if deleted.status_code < 200 or deleted.status_code >= 300:
+                raise AssertionError(f"fixture assistant cleanup returned HTTP {deleted.status_code}")
+            checks.append("caller_route_cleanup")
+    print(json.dumps({"result": "PASS", "checks": checks}, sort_keys=True))
 
 
 asyncio.run(main())

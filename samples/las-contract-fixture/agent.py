@@ -13,6 +13,7 @@ class FixtureState(TypedDict, total=False):
     system_prompt: str
     response: str
     context_keys: list[str]
+    context_summary: dict[str, Any]
     pause: bool
 
 

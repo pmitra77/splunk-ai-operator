@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Created comprehensive API documentation
 - Added architecture diagrams
 - Created troubleshooting guides
+- Clarified LAS air-gapped mode, disabled tracing, managed Secret inputs, and the POC-only license evidence and release-image qualification gate.
 
 ## [0.2.0] - 2025-01-17
 

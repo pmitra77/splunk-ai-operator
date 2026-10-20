@@ -5,11 +5,34 @@ import (
 	"errors"
 	"testing"
 
+	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestLASReconcileRejectsAirgappedTracingBeforeHelm(t *testing.T) {
+	for _, endpoint := range []string{"https://api.smith.langchain.com", "https://langsmith.internal"} {
+		t.Run(endpoint, func(t *testing.T) {
+			helm := &fakeLASHelmActions{}
+			r, ai := testLASReconciler(t, helm, false)
+			ai.Spec.Feature.LAS.NetworkMode = "airgapped"
+			ai.Spec.Feature.LAS.Tracing = &aiv1.LASTracingSpec{Enabled: true, Endpoint: endpoint}
+			require.NoError(t, r.Update(context.Background(), ai))
+
+			err := r.Reconcile(context.Background(), ai)
+			require.ErrorContains(t, err, "LAS tracing is not supported in airgapped mode")
+			require.Zero(t, helm.installCalls, "invalid configuration must not install LAS")
+			require.Zero(t, helm.upgradeCalls, "invalid configuration must not upgrade LAS")
+			require.Nil(t, helm.current)
+			ready := meta.FindStatusCondition(ai.Status.Conditions, "Ready")
+			require.NotNil(t, ready)
+			require.Equal(t, metav1.ConditionFalse, ready.Status)
+			require.Equal(t, "ConfigurationInvalid", ready.Reason)
+		})
+	}
+}
 
 func TestLASReconcileInstallsOwnedReleaseWithDesiredValues(t *testing.T) {
 	r, ai, helm := healthyLASReconcileFixture(t, 1, true, corev1.ConditionTrue)

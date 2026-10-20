@@ -161,8 +161,8 @@ func TestLASTracingSettingsReachAPIAndQueueWorkloads(t *testing.T) {
 	disabledValues := lasValues(ai)
 	ai.Spec.Feature.LAS.Tracing.Endpoint = "https://langsmith.internal"
 	endpointValues := lasValues(ai)
-	if sameValues(disabledValues, endpointValues) {
-		t.Fatal("changing the tracing endpoint must change the Helm values even when tracing is disabled")
+	if !sameValues(disabledValues, endpointValues) {
+		t.Fatal("a tracing endpoint must be ignored while tracing is disabled")
 	}
 	ai.Spec.Feature.LAS.Tracing.Enabled = true
 	values := lasValues(ai)
@@ -203,6 +203,98 @@ func TestLASTracingSettingsReachAPIAndQueueWorkloads(t *testing.T) {
 		if !strings.Contains(manifest, "name: LANGSMITH_API_KEY\n              valueFrom:") {
 			t.Errorf("%s does not source the LangSmith credential from the existing Secret", template)
 		}
+	}
+}
+
+func TestLASDisabledTracingRendersForAPIAndQueue(t *testing.T) {
+	chart, err := loader.LoadArchive(bytes.NewReader(lasChartArchive))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name        string
+		networkMode string
+		tracing     *aiv1.LASTracingSpec
+	}{
+		{name: "connected omitted", networkMode: "connected"},
+		{name: "airgapped omitted", networkMode: "airgapped"},
+		{name: "airgapped disabled", networkMode: "airgapped", tracing: &aiv1.LASTracingSpec{Enabled: false}},
+		{
+			name: "airgapped disabled with endpoint", networkMode: "airgapped",
+			tracing: &aiv1.LASTracingSpec{Enabled: false, Endpoint: "https://unused.internal"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ai := &aiv1.AIService{}
+			ai.Name = "fixture"
+			ai.Spec.Feature = aiv1.FeatureSpec{
+				LicenseSecretRef:  "las-credentials",
+				PostgresSecretRef: "fixture-postgres",
+				RedisSecretRef:    "fixture-redis",
+				LAS: &aiv1.LASFeatureSpec{
+					Image:       aiv1.LASImageSpec{Repository: "registry.example/fixture", Tag: "candidate-123"},
+					AssistantID: "contract_fixture",
+					NetworkMode: tt.networkMode,
+					Tracing:     tt.tracing,
+				},
+			}
+			values := lasValues(ai)
+			renderValues, err := chartutil.ToRenderValues(
+				chart, values,
+				chartutil.ReleaseOptions{Name: "las-fixture", Namespace: "default"},
+				chartutil.DefaultCapabilities,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rendered, err := engine.Render(chart, renderValues)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, workload := range []struct{ name, valuesKey, template string }{
+				{"API", "apiServer", "langgraph-cloud/templates/api-server/deployment.yaml"},
+				{"queue", "queue", "langgraph-cloud/templates/queue/deployment.yaml"},
+			} {
+				deploymentValues := values[workload.valuesKey].(map[string]interface{})["deployment"].(map[string]interface{})
+				envValues := deploymentValues["extraEnv"].([]map[string]interface{})
+				if len(envValues) != 1 || envValues[0]["name"] != "LANGSMITH_TRACING" || envValues[0]["value"] != "false" {
+					t.Errorf("%s tracing Helm values = %#v, want only LANGSMITH_TRACING=false", workload.name, envValues)
+				}
+				var deployment appsv1.Deployment
+				if err := yaml.Unmarshal([]byte(rendered[workload.template]), &deployment); err != nil {
+					t.Fatalf("parse %s Deployment: %v", workload.name, err)
+				}
+				if len(deployment.Spec.Template.Spec.Containers) == 0 {
+					t.Fatalf("%s Deployment has no containers", workload.name)
+				}
+				var traceCount, keyCount int
+				for _, env := range deployment.Spec.Template.Spec.Containers[0].Env {
+					switch env.Name {
+					case "LANGSMITH_TRACING":
+						traceCount++
+						if env.Value != "false" {
+							t.Errorf("%s rendered LANGSMITH_TRACING=%q, want false", workload.name, env.Value)
+						}
+					case "LANGSMITH_ENDPOINT":
+						t.Errorf("%s rendered an endpoint while tracing is disabled", workload.name)
+					case "LANGSMITH_API_KEY":
+						keyCount++
+						if env.Value != "" || env.ValueFrom == nil ||
+							env.ValueFrom.SecretKeyRef == nil ||
+							env.ValueFrom.SecretKeyRef.Optional == nil ||
+							!*env.ValueFrom.SecretKeyRef.Optional {
+							t.Errorf("%s requires a LangSmith API key while tracing is disabled: %#v", workload.name, env)
+						}
+					}
+				}
+				if traceCount != 1 {
+					t.Errorf("%s rendered %d LANGSMITH_TRACING variables, want one", workload.name, traceCount)
+				}
+				if keyCount != 1 {
+					t.Errorf("%s rendered %d LANGSMITH_API_KEY references, want one optional reference", workload.name, keyCount)
+				}
+			}
+		})
 	}
 }
 

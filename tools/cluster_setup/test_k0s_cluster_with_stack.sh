@@ -92,6 +92,7 @@ _load_functions() {
   eval "$(_extract_fn configure_images)"
   eval "$(_extract_fn validate_scale_factor_config)"
   eval "$(_extract_fn yaml_single_quote)"
+  eval "$(_extract_fn resolve_airgap_mode)"
   eval "$(_extract_fn render_las_feature_yaml)"
   eval "$(_extract_fn render_las_secret_refs)"
   eval "$(_extract_fn check_las_metrics_prerequisite)"
@@ -103,6 +104,62 @@ _load_functions() {
 }
 
 _load_functions
+
+# ── Tests: effective network mode is independent of platform profile ────────
+suite "resolve_airgap_mode"
+echo "▶ resolve_airgap_mode"
+_mode_tmpdir=$(mktemp -d)
+for _profile in full cpuOnly; do
+  for _airgap in false true; do
+    _mode_config="${_mode_tmpdir}/${_profile}-${_airgap}.yaml"
+    cat > "${_mode_config}" <<YAML
+cluster:
+  airgap: ${_airgap}
+aiPlatform:
+  profile: ${_profile}
+  features:
+    - name: agentruntime
+      las:
+        image:
+          repository: registry.example/las
+          tag: v1
+        assistantId: sample
+YAML
+    _expected_network_mode="connected"
+    [[ "${_airgap}" == "true" ]] && _expected_network_mode="airgapped"
+    _resolved_airgap=$(resolve_airgap_mode "${_mode_config}" "")
+    assert_eq "${_profile} with cluster.airgap=${_airgap} resolves independently" "${_airgap}" "${_resolved_airgap}"
+    _effective_network_mode="connected"
+    [[ "${_resolved_airgap}" == "true" ]] && _effective_network_mode="airgapped"
+    _rendered_mode=$(render_las_feature_yaml "${_mode_config}" 0 "${_effective_network_mode}")
+    assert_eq "${_profile} with cluster.airgap=${_airgap} renders ${_expected_network_mode}" \
+      "1" "$(grep -c "networkMode: ${_expected_network_mode}" <<<"${_rendered_mode}" || true)"
+  done
+done
+cat > "${_mode_tmpdir}/omitted.yaml" <<'YAML'
+cluster: {}
+YAML
+assert_eq "omitted cluster.airgap defaults to connected" "false" \
+  "$(resolve_airgap_mode "${_mode_tmpdir}/omitted.yaml" "")"
+assert_eq "air-gap bundle override enables air-gapped mode" "true" \
+  "$(resolve_airgap_mode "${_mode_tmpdir}/full-false.yaml" true)"
+assert_eq "false override does not disable cluster.airgap=true" "true" \
+  "$(resolve_airgap_mode "${_mode_tmpdir}/full-true.yaml" false)"
+cat > "${_mode_tmpdir}/invalid.yaml" <<'YAML'
+cluster:
+  airgap: maybe
+YAML
+assert_rc "rejects unsupported cluster.airgap value" 1 \
+  resolve_airgap_mode "${_mode_tmpdir}/invalid.yaml" ""
+cat > "${_mode_tmpdir}/quoted.yaml" <<'YAML'
+cluster:
+  airgap: "true"
+YAML
+assert_rc "rejects quoted cluster.airgap instead of treating it as a boolean" 1 \
+  resolve_airgap_mode "${_mode_tmpdir}/quoted.yaml" ""
+assert_rc "rejects unsupported AIRGAP_MODE override" 1 \
+  resolve_airgap_mode "${_mode_tmpdir}/full-false.yaml" maybe
+rm -rf "${_mode_tmpdir}"
 
 # ── Tests: LAS AIPlatform rendering allow-list and effective network mode ────
 suite "render_las_feature_yaml"
@@ -130,11 +187,14 @@ aiPlatform:
             targetCPUUtilizationPercentage: 80
         credentials:
           postgresConnectionUrl: DO_NOT_RENDER_POSTGRES_URL
+          langsmithApiKey: DO_NOT_RENDER_LANGSMITH_KEY
 YAML
-_las_rendered=$(render_las_feature_yaml "${_las_tmpdir}/config.yaml" 0 airgapped)
-assert_eq "effective air-gapped mode is rendered" "1" "$(grep -c 'networkMode: airgapped' <<<"${_las_rendered}" || true)"
+_las_rendered=$(render_las_feature_yaml "${_las_tmpdir}/config.yaml" 0 connected)
+assert_eq "effective connected mode is rendered" "1" "$(grep -c 'networkMode: connected' <<<"${_las_rendered}" || true)"
 assert_eq "queue CPU and autoscaling settings are rendered" "1" "$(grep -c 'targetCPUUtilizationPercentage: 80' <<<"${_las_rendered}" || true)"
 assert_eq "raw PostgreSQL credential is excluded" "0" "$(grep -c 'DO_NOT_RENDER_POSTGRES_URL' <<<"${_las_rendered}" || true)"
+assert_eq "raw LangSmith key is excluded" "0" "$(grep -c 'DO_NOT_RENDER_LANGSMITH_KEY' <<<"${_las_rendered}" || true)"
+assert_eq "tracing is explicitly disabled" "1" "$(grep -c 'enabled: false' <<<"${_las_rendered}" || true)"
 {
   printf 'spec:\n  features:\n    - name: agentruntime\n'
   # Match the installer concatenation: command substitution strips the renderer's
@@ -142,7 +202,7 @@ assert_eq "raw PostgreSQL credential is excluded" "0" "$(grep -c 'DO_NOT_RENDER_
   printf '%s' "${_las_rendered}"$'\n'
   printf '      serviceAccountName: fixture-sa\n'
 } > "${_las_tmpdir}/rendered.yaml"
-assert_eq "rendered LAS feature is valid YAML" "airgapped" "$(yq eval -r '.spec.features[0].las.networkMode' "${_las_tmpdir}/rendered.yaml")"
+assert_eq "rendered LAS feature is valid YAML" "connected" "$(yq eval -r '.spec.features[0].las.networkMode' "${_las_tmpdir}/rendered.yaml")"
 assert_eq "following feature field remains valid YAML" "fixture-sa" "$(yq eval -r '.spec.features[0].serviceAccountName' "${_las_tmpdir}/rendered.yaml")"
 _las_refs=$(render_las_secret_refs "${_las_tmpdir}/config.yaml" 0 true '{"managed":true,"licenseSecretRef":"las-auth-generated","postgresSecretRef":"las-postgres-generated","redisSecretRef":"las-redis-generated"}')
 assert_eq "managed license Secret reference replaces legacy ref" "1" "$(grep -c 'licenseSecretRef: \"las-auth-generated\"' <<<"${_las_refs}" || true)"
@@ -155,6 +215,70 @@ assert_eq "managed Secret references never render credential values" "0" "$(grep
   printf '      serviceAccountName: fixture-sa\n'
 } > "${_las_tmpdir}/managed-rendered.yaml"
 assert_eq "managed credentials render as references in valid CR YAML" "las-postgres-generated" "$(yq eval -r '.spec.features[0].postgresSecretRef' "${_las_tmpdir}/managed-rendered.yaml")"
+_airgapped_key_rc=0
+_airgapped_key_stdout=$(render_las_feature_yaml "${_las_tmpdir}/config.yaml" 0 airgapped 2>"${_las_tmpdir}/airgapped-key-error.txt") || _airgapped_key_rc=$?
+assert_eq "air-gapped mode rejects a LangSmith API key" "1" "${_airgapped_key_rc}"
+assert_eq "air-gapped key rejection emits no partial LAS YAML" "" "${_airgapped_key_stdout}"
+assert_eq "rejected air-gapped key is absent from output" "0" \
+  "$(grep -c 'DO_NOT_RENDER_LANGSMITH_KEY' <<<"${_airgapped_key_stdout}" || true)"
+assert_eq "rejected air-gapped key is absent from diagnostics" "0" \
+  "$(grep -c 'DO_NOT_RENDER_LANGSMITH_KEY' "${_las_tmpdir}/airgapped-key-error.txt" || true)"
+cat > "${_las_tmpdir}/newline-key.yaml" <<'YAML'
+aiPlatform:
+  features:
+    - name: agentruntime
+      las:
+        credentials:
+          langsmithApiKey: "\n\n"
+YAML
+_newline_key_rc=0
+_newline_key_stdout=$(render_las_feature_yaml "${_las_tmpdir}/newline-key.yaml" 0 airgapped 2>"${_las_tmpdir}/newline-key-error.txt") || _newline_key_rc=$?
+assert_eq "air-gapped mode rejects a newline-only LangSmith API key" "1" "${_newline_key_rc}"
+assert_eq "newline-only key rejection emits no partial LAS YAML" "" "${_newline_key_stdout}"
+cat > "${_las_tmpdir}/disabled-endpoint.yaml" <<'YAML'
+aiPlatform:
+  features:
+    - name: agentruntime
+      las:
+        tracing:
+          enabled: false
+          endpoint: https://public-tracing.example.com
+YAML
+_disabled_rendered=$(render_las_feature_yaml "${_las_tmpdir}/disabled-endpoint.yaml" 0 airgapped)
+assert_eq "disabled tracing does not render a stale endpoint" "0" \
+  "$(grep -c 'endpoint:' <<<"${_disabled_rendered}" || true)"
+cat > "${_las_tmpdir}/enabled-tracing.yaml" <<'YAML'
+aiPlatform:
+  features:
+    - name: agentruntime
+      las:
+        tracing:
+          enabled: true
+          endpoint: https://internal-tracing.example.test
+YAML
+assert_rc "air-gapped mode rejects enabled tracing with any endpoint" 1 \
+  render_las_feature_yaml "${_las_tmpdir}/enabled-tracing.yaml" 0 airgapped
+assert_rc "connected mode permits enabled tracing" 0 \
+  render_las_feature_yaml "${_las_tmpdir}/enabled-tracing.yaml" 0 connected
+cat > "${_las_tmpdir}/invalid-tracing.yaml" <<'YAML'
+aiPlatform:
+  features:
+    - name: agentruntime
+      las:
+        tracing:
+          enabled: maybe
+YAML
+assert_rc "renderer rejects a nonboolean tracing.enabled value" 1 \
+  render_las_feature_yaml "${_las_tmpdir}/invalid-tracing.yaml" 0 connected
+cat > "${_las_tmpdir}/omitted-tracing.yaml" <<'YAML'
+aiPlatform:
+  features:
+    - name: agentruntime
+      las: {}
+YAML
+_omitted_rendered=$(render_las_feature_yaml "${_las_tmpdir}/omitted-tracing.yaml" 0 airgapped)
+assert_eq "omitted tracing renders disabled" "1" \
+  "$(grep -c '^          enabled: false$' <<<"${_omitted_rendered}" || true)"
 _metric_config="${_las_tmpdir}/metrics.yaml"
 cat > "${_metric_config}" <<'YAML'
 aiPlatform:

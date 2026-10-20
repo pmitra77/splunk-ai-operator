@@ -222,19 +222,17 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&aiv1.AIService{}).
 		Named("aiservice").
 		// Owned resources with specific predicates to avoid reconciliation loops
 		Owns(&corev1.ServiceAccount{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&corev1.ConfigMap{}, builder.WithPredicates(common.ConfigMapChangedPredicate())).
 		Owns(&corev1.Secret{}, builder.WithPredicates(common.SecretChangedPredicate())).
-		Owns(&certmanagerv1.Certificate{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&batchv1.Job{}, builder.WithPredicates(common.JobChangedPredicate())).
 		Owns(&appsv1.Deployment{}, builder.WithPredicates(common.DeploymentChangedPredicate())).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&corev1.Service{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		Owns(&monitoringv1.ServiceMonitor{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// Watch referenced AIPlatform (not owned by AIService)
 		Watches(
 			&aiv1.AIPlatform{},
@@ -256,13 +254,37 @@ func (r *AIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			common.GenerationChangedPredicate(),
 			common.AnnotationChangedPredicate(),
 			common.LabelChangedPredicate(),
+			// Owned Deployment status changes must reach the reconciler so
+			// SLIM readiness follows rollout and pod availability changes.
+			common.DeploymentChangedPredicate(),
 			checkpointSecretChangedPredicate(),
 		)).
 		// Configure concurrency control
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: aiv1.TotalWorker,
-		}).
-		Complete(r)
+		})
+
+	// CPU-only clusters can omit optional certificate and Prometheus operators.
+	// A watch for an absent custom resource would prevent the controller from
+	// starting even when the selected features do not create that resource.
+	for _, optional := range []struct {
+		group   string
+		version string
+		kind    string
+		obj     client.Object
+	}{
+		{"cert-manager.io", "v1", "Certificate", &certmanagerv1.Certificate{}},
+		{"monitoring.coreos.com", "v1", "ServiceMonitor", &monitoringv1.ServiceMonitor{}},
+	} {
+		present, err := optionalResourcePresent(mgr, optional.group, optional.version, optional.kind)
+		if err != nil {
+			return err
+		}
+		if present {
+			b = b.Owns(optional.obj, builder.WithPredicates(predicate.GenerationChangedPredicate{}))
+		}
+	}
+	return b.Complete(r)
 }
 
 // --- 8️⃣ reconcileStatus: update CR status/conditions ---

@@ -16,6 +16,30 @@ import (
 
 // Validate checks required fields and backfills defaults on the AIPlatform spec.
 func (r *AIPlatformReconciler) validate(ctx context.Context, p *aiApi.AIPlatform) error {
+	if p.Spec.Profile != "" && p.Spec.Profile != aiApi.AIPlatformProfileFull && p.Spec.Profile != aiApi.AIPlatformProfileCPUOnly {
+		return fmt.Errorf("unsupported AIPlatform profile %q", p.Spec.Profile)
+	}
+	if p.Spec.Profile == aiApi.AIPlatformProfileCPUOnly {
+		if p.Status.RayServiceName != "" || p.Status.VectorDbServiceName != "" || p.Status.RayServiceStatus != "" {
+			return fmt.Errorf("switching an existing model-serving AIPlatform to cpuOnly is not supported")
+		}
+		if p.Spec.GpuInstanceType != "" || p.Spec.DefaultAcceleratorType != "" || p.Spec.GPUSchedulingSpec != nil || p.Spec.WorkerGroupConfig != nil ||
+			(p.Spec.ScaleFactor != nil && *p.Spec.ScaleFactor > 1) || p.Spec.Images.RayHeadGroupImage != "" || p.Spec.Images.RayWorkerGroupImage != "" ||
+			p.Spec.Images.WeaviateImage != "" || p.Spec.Images.SAIAImage != "" || p.Spec.Ingress != nil && p.Spec.Ingress.Enabled {
+			return fmt.Errorf("cpuOnly profile does not support Ray, Weaviate, SAIA, GPU, or Ray-backed ingress settings")
+		}
+		if p.Spec.Storage.VectorDB.Size != "" || p.Spec.Storage.VectorDB.PVCName != "" || p.Spec.Storage.VectorDB.StorageClassName != "" {
+			return fmt.Errorf("cpuOnly profile does not support vectorDB storage settings")
+		}
+		for _, feature := range p.Spec.Features {
+			if feature.Name == "saia" || feature.Name == "seca" {
+				return fmt.Errorf("cpuOnly profile does not support %s feature", feature.Name)
+			}
+		}
+		if p.Spec.Sidecars.Envoy || p.Spec.Sidecars.Otel || p.Spec.Sidecars.PrometheusOperator {
+			return fmt.Errorf("cpuOnly profile does not support sidecars")
+		}
+	}
 	// Required volume paths
 	if p.Spec.ObjectStorage.Path == "" {
 		return fmt.Errorf("object storage is required")
@@ -27,7 +51,7 @@ func (r *AIPlatformReconciler) validate(ctx context.Context, p *aiApi.AIPlatform
 			Affinity:     &corev1.Affinity{},
 		}
 	}
-	if p.Spec.GPUSchedulingSpec == nil {
+	if p.Spec.Profile != aiApi.AIPlatformProfileCPUOnly && p.Spec.GPUSchedulingSpec == nil {
 		p.Spec.GPUSchedulingSpec = &aiApi.SchedulingSpec{
 			NodeSelector: map[string]string{},
 			Tolerations:  []corev1.Toleration{},

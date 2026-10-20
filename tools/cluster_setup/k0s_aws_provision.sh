@@ -23,6 +23,7 @@
 #   ./k0s_aws_provision.sh dry-run   [--config FILE]
 # =============================================================================
 set -euo pipefail
+umask 077 # State can contain generated credentials in connected mode.
 export AWS_PAGER="" AWS_DEFAULT_OUTPUT=json PAGER=cat LANG=C LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,7 +59,11 @@ cfg_default() { yq eval "${1} // \"${2}\"" "${CONFIG_FILE}"; }
 STATE_FILE=""   # set in load_config
 
 save_state() { local key="$1" val="$2"; echo "${key}=${val}" >> "${STATE_FILE}"; }
-load_state()  { [[ -f "${STATE_FILE}" ]] && source "${STATE_FILE}" || true; }
+load_state()  {
+  [[ -f "${STATE_FILE}" ]] && source "${STATE_FILE}" || true
+  # Older connected-mode state files recorded only EIP.
+  INSTALLER_HOST="${INSTALLER_HOST:-${EIP:-}}"
+}
 
 # -- Load config --
 load_config() {
@@ -67,6 +72,11 @@ load_config() {
   REGION="$(cfg '.region')"
   AZ="$(cfg '.availabilityZone')"
   SSH_CIDR="$(cfg_default '.sshAllowedCidr' '0.0.0.0/0')"
+  NETWORK_MODE="$(cfg_default '.network.mode' 'connected')"
+  [[ "${NETWORK_MODE}" == "connected" || "${NETWORK_MODE}" == "private" ]] ||
+    err "network.mode must be connected or private"
+  PRIVATE_MODE=false
+  [[ "${NETWORK_MODE}" == "private" ]] && PRIVATE_MODE=true
 
   # Network — VPC, subnets, NAT, IGW.
   # Empty vpcId → auto-create the whole network stack.
@@ -76,6 +86,11 @@ load_config() {
   [[ "${REGION}" == "us-west-2" ]] && _vpc_default="vpc-09b191e89c83d588e"
   VPC_ID="$(cfg_default '.network.vpcId' "${_vpc_default}")"
   [[ "$VPC_ID" == "null" ]] && VPC_ID=""
+  # Private mode must never silently pick the shared VPC.
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    VPC_ID="$(cfg_default '.network.vpcId' '')"
+    [[ "$VPC_ID" == "null" ]] && VPC_ID=""
+  fi
 
   AUTO_CREATE_NETWORK=false
   [[ -z "$VPC_ID" ]] && AUTO_CREATE_NETWORK=true
@@ -84,6 +99,16 @@ load_config() {
   [[ "$SUBNET_ID" == "null" || -z "$SUBNET_ID" ]] && SUBNET_ID=""
   INSTALLER_SUBNET_ID="$(cfg_default '.network.installerSubnetId' '')"
   [[ "$INSTALLER_SUBNET_ID" == "null" || -z "$INSTALLER_SUBNET_ID" ]] && INSTALLER_SUBNET_ID=""
+  PRIVATE_EGRESS_CIDRS="$(cfg '.network.allowedEgressCidrs[]' 2>/dev/null || true)"
+  PRIVATE_AMI_ID="$(cfg_default '.ami.id' '')"
+  BUNDLE_TRANSFER_MODE="$(cfg_default '.install.bundleTransferMode' 'local-copy')"
+  AIRGAP_BUNDLE_PATH="$(cfg_default '.install.airgapBundlePath' '')"
+  AIRGAP_BUNDLE_SHA256="$(cfg_default '.install.airgapBundleSha256' '')"
+  BUNDLE_PROFILE_PATH="$(cfg_default '.install.bundleProfilePath' '')"
+  WORKLOAD_IMAGES_PATH="$(cfg_default '.install.workloadImagesPath' '')"
+  PRIVATE_KNOWN_HOSTS_FILE="$(cfg_default '.network.knownHostsFile' '')"
+  PRIVATE_SSH_CONFIG_FILE="$(cfg_default '.network.sshConfigFile' '')"
+  [[ "$PRIVATE_SSH_CONFIG_FILE" == "null" ]] && PRIVATE_SSH_CONFIG_FILE=""
 
   # CIDR blocks used when auto-creating network (only relevant when AUTO_CREATE_NETWORK=true)
   VPC_CIDR="$(cfg_default '.network.vpcCidr' '10.0.0.0/16')"
@@ -122,6 +147,7 @@ load_config() {
 
   CLUSTER_CONFIG_TEMPLATE="$(cfg_default '.install.clusterConfigTemplate' 'k0s-cluster-config.yaml')"
   [[ "$CLUSTER_CONFIG_TEMPLATE" == "null" || -z "$CLUSTER_CONFIG_TEMPLATE" ]] && CLUSTER_CONFIG_TEMPLATE="k0s-cluster-config.yaml"
+  CLUSTER_CONFIG_FILE="$(cfg_default '.install.clusterConfigFile' '')"
   INSTALL_MODEL_STAGING_ENABLED="$(cfg '.install.modelStaging.enabled' 2>/dev/null || echo "null")"
   [[ "$INSTALL_MODEL_STAGING_ENABLED" == "null" || -z "$INSTALL_MODEL_STAGING_ENABLED" ]] && INSTALL_MODEL_STAGING_ENABLED=""
 
@@ -139,16 +165,396 @@ load_config() {
   [[ "$SEAWEED_ENDPOINT" == "null" ]] && SEAWEED_ENDPOINT=""
 
   TAG_KEY="k0s-provision-stack"
-  STATE_FILE="${HOME}/.k0s-provision-${STACK_NAME}.state"
+  local state_dir="${K0S_PROVISION_STATE_DIR:-${HOME}}"
+  [[ "$state_dir" == /* && -d "$state_dir" ]] ||
+    err "K0S_PROVISION_STATE_DIR must be an existing absolute directory"
+  if [[ -n "${K0S_PROVISION_STATE_DIR:-}" ]]; then
+    python3 - "$state_dir" <<'PY' || err "K0S_PROVISION_STATE_DIR must be a non-symlink directory owned by the current user with mode 0700 or stricter"
+import os
+import stat
+import sys
+
+info = os.lstat(sys.argv[1])
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+    sys.exit(1)
+PY
+  fi
+  STATE_FILE="${state_dir}/.k0s-provision-${STACK_NAME}.state"
+  [[ "$PRIVATE_KNOWN_HOSTS_FILE" == "null" || -z "$PRIVATE_KNOWN_HOSTS_FILE" ]] &&
+    PRIVATE_KNOWN_HOSTS_FILE="${STATE_FILE}.known_hosts"
+  return 0
 }
 
 # -- AWS auth check --
 check_aws_auth() {
   local identity
-  identity=$(aws sts get-caller-identity --region "${REGION}" --output json 2>/dev/null) \
-    || err "AWS credentials not configured or expired.
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    [[ -n "${AWS_PROFILE:-}" && "${AWS_PROFILE}" != "default" ]] ||
+      err "private mode requires an explicit named AWS_PROFILE for the approved cluster account"
+  fi
+  identity=$(aws sts get-caller-identity --region "${REGION}" --output json 2>/dev/null) || {
+    if [[ "$PRIVATE_MODE" == "true" ]]; then
+      err "AWS credentials not configured or expired for the selected private cluster account"
+    fi
+    err "AWS credentials not configured or expired.
 Run: eval \"\$(okta-aws-login -a splunkcloud-ai-dev --role-arn arn:aws:iam::658391232643:role/splunkcloud_account_admin)\""
-  log "AWS identity: $(echo "$identity" | jq -r '.Arn')"
+  }
+  CURRENT_AWS_ACCOUNT_ID="$(jq -r '.Account' <<< "$identity")"
+  log "AWS identity: account ${CURRENT_AWS_ACCOUNT_ID}, role $(jq -r '.Arn' <<< "$identity")"
+}
+
+# Require an explicit, bounded IPv4 range. Some approved VPCs use
+# publicly-routable address space internally; their route tables, public-IP
+# settings and explicit SG destinations determine egress isolation.
+require_bounded_ipv4_cidr() {
+  local cidr="$1" label="$2"
+  python3 - "$cidr" <<'PY' || err "${label} must be an IPv4 CIDR of /8 or narrower: ${cidr}"
+import ipaddress
+import sys
+try:
+    network = ipaddress.ip_network(sys.argv[1], strict=True)
+    assert network.version == 4 and network.prefixlen >= 8
+except (ValueError, AssertionError):
+    sys.exit(1)
+PY
+}
+
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+# The CPU-only bundle builder writes exactly these five selected product image
+# references to images/workload-images.list. Compare the whole set, so a stale
+# or broader bundle cannot silently add a public/GPU workload image.
+private_expected_workload_refs() {
+  local deployment="$1" image_registry="$2" expression expected
+  local refs=()
+  for expression in '.images.operator.image' '.images.splunk.image' \
+                    '.images.splunk.operatorImage' '.images.slim.apiImage'; do
+    expected="$(yq eval -r "${expression} // \"\"" "$deployment")"
+    [[ -n "$expected" && "$expected" != "null" &&
+       "$expected" == "${image_registry}/"* && "$expected" == *:* &&
+       "$expected" != *CHANGEME* && "$expected" != *CHANGE_ME* ]] ||
+      err "Completed deployment config is missing ${expression}"
+    refs+=("$expected")
+  done
+  local las_repository las_tag
+  las_repository="$(yq eval -r '.aiPlatform.features[] | select(.name == "agentruntime") | .las.image.repository' "$deployment")"
+  las_tag="$(yq eval -r '.aiPlatform.features[] | select(.name == "agentruntime") | .las.image.tag' "$deployment")"
+  [[ "$las_repository" == "${image_registry}/"* && -n "$las_tag" &&
+     "$las_repository" != *CHANGEME* && "$las_tag" != "null" &&
+     "$las_tag" != "latest" && "$las_tag" != "preview" &&
+     "$las_tag" != *CHANGE_ME* ]] ||
+    err "Completed deployment config is missing its LAS image"
+  refs+=("${las_repository}:${las_tag}")
+  printf '%s\n' "${refs[@]}" | LC_ALL=C sort -u
+}
+
+validate_private_workload_refs() {
+  local workload_images="$1" expected_refs="$2" source="$3"
+  local actual_refs
+  actual_refs="$(printf '%s\n' "$workload_images" | LC_ALL=C sort -u)"
+  [[ "$actual_refs" == "$expected_refs" ]] ||
+    err "${source} workload image list does not exactly match the selected CPU-only images"
+}
+
+private_bundle_evidence_from_archive() {
+  local archive="$1" entries profile_entry workload_entry profile workload_images
+  entries="$(tar -tzf "$archive")" || err "Cannot list air-gap bundle ${archive}"
+  profile_entry="$(printf '%s\n' "$entries" | awk '/^[^\/]+\/bundle-profile\.txt$/ {print}')"
+  workload_entry="$(printf '%s\n' "$entries" | awk '/^[^\/]+\/images\/workload-images\.list$/ {print}')"
+  [[ -n "$profile_entry" && "$profile_entry" != *$'\n'* &&
+     -n "$workload_entry" && "$workload_entry" != *$'\n'* &&
+     "${profile_entry%%/*}" == "${workload_entry%%/*}" ]] ||
+    err "Private bundle must contain one CPU-only profile and workload image list under the same root"
+  profile="$(tar -xOf "$archive" "$profile_entry")" || err "Cannot read bundle profile"
+  workload_images="$(tar -xOf "$archive" "$workload_entry")" || err "Cannot read bundle workload images"
+  [[ "$profile" == "cpuOnly" ]] || err "Private bundle was not built for cpuOnly"
+  printf '%s\n' "$workload_images"
+}
+
+validate_private_config() {
+  [[ "$PRIVATE_MODE" == "true" ]] || return 0
+  yq eval -o=json "$CONFIG_FILE" |
+    jq -e '[paths(scalars) as $path |
+      select((($path[-1] | tostring | ascii_downcase) |
+        test("(password|token|secretaccesskey|accesskeyid|apikey|privatekey|jsonkey|licensekey)$"))
+        and (getpath($path) != null and getpath($path) != ""))
+    ] | length == 0' >/dev/null ||
+    err "Private AWS provision config must not contain inline credentials"
+  [[ "$STACK_NAME" =~ ^[a-zA-Z0-9-]+$ ]] || err "private stackName must contain only letters, digits and hyphens"
+  [[ "$VPC_ID" =~ ^vpc-[a-f0-9]+$ ]] || err "private mode requires an explicit existing network.vpcId"
+  [[ "$SUBNET_ID" =~ ^subnet-[a-f0-9]+$ ]] || err "private mode requires network.subnetId"
+  [[ "$INSTALLER_SUBNET_ID" =~ ^subnet-[a-f0-9]+$ ]] || err "private mode requires network.installerSubnetId"
+  [[ "$PRIVATE_AMI_ID" =~ ^ami-[a-f0-9]+$ ]] || err "private mode requires an explicit prepared ami.id"
+  [[ "$PRIVATE_KNOWN_HOSTS_FILE" == /* ]] ||
+    err "private mode requires an absolute network.knownHostsFile path"
+  [[ -d "$(dirname "$PRIVATE_KNOWN_HOSTS_FILE")" ]] ||
+    err "private mode requires the network.knownHostsFile parent directory to exist"
+  if [[ -n "$PRIVATE_SSH_CONFIG_FILE" ]]; then
+    [[ "$PRIVATE_SSH_CONFIG_FILE" == /* && -f "$PRIVATE_SSH_CONFIG_FILE" && -r "$PRIVATE_SSH_CONFIG_FILE" ]] ||
+      err "private mode network.sshConfigFile must be an absolute, readable file"
+    [[ "$PRIVATE_SSH_CONFIG_FILE" != *[[:space:]]* ]] ||
+      err "private mode network.sshConfigFile cannot contain whitespace"
+  fi
+  [[ "$KEY_LOCAL" == /* && -d "$(dirname "$KEY_LOCAL")" ]] ||
+    err "private mode requires an absolute keyPair.localPath with an existing parent directory"
+  [[ "$KEY_LOCAL" != *[[:space:]]* && "$PRIVATE_KNOWN_HOSTS_FILE" != *[[:space:]]* ]] ||
+    err "private SSH key and known-hosts paths cannot contain whitespace"
+  [[ "$CTRL_COUNT" =~ ^[1-9][0-9]*$ && "$CPU_COUNT" =~ ^[1-9][0-9]*$ ]] ||
+    err "private mode requires at least one controller and one CPU worker"
+  [[ "$GPU_COUNT" == "0" ]] || err "private mode requires nodes.gpuWorker.count: 0"
+  [[ "$MINIO_ENABLED" == "false" ]] || err "private mode requires minio.enabled: false (use an existing private object store)"
+  [[ "$INSTALL_MODEL_STAGING_ENABLED" == "false" ]] || err "private mode requires install.modelStaging.enabled: false"
+  [[ -z "$ECR_ACCOUNT" ]] || err "private mode cannot forward ECR credentials; pre-bundle all images"
+  [[ -n "$PRIVATE_EGRESS_CIDRS" ]] || err "private mode requires network.allowedEgressCidrs"
+  require_bounded_ipv4_cidr "$SSH_CIDR" "sshAllowedCidr"
+  local cidr
+  while IFS= read -r cidr; do
+    [[ -z "$cidr" ]] && continue
+    require_bounded_ipv4_cidr "$cidr" "network.allowedEgressCidrs"
+  done <<< "$PRIVATE_EGRESS_CIDRS"
+
+  [[ "$CLUSTER_CONFIG_FILE" == /* && -f "$CLUSTER_CONFIG_FILE" ]] ||
+    err "private mode requires an absolute install.clusterConfigFile path to a completed, private config"
+  local deployment="$CLUSTER_CONFIG_FILE"
+  local deployment_json
+  deployment_json="$(yq eval -o=json "$deployment")"
+  jq -e '
+    [paths(scalars) as $path |
+      select(
+        (($path[-1] | tostring | ascii_downcase) |
+          test("(password|token|secretaccesskey|accesskeyid|apikey|privatekey|jsonkey|licensekey)$"))
+        and (getpath($path) != null and getpath($path) != "")
+      )
+    ] | length == 0
+  ' <<< "$deployment_json" >/dev/null ||
+    err "Private deployment config contains inline credentials; use Kubernetes Secret references and provide object-store credentials at install time"
+  [[ "$(yq eval -r '.cluster.airgap' "$deployment")" == "true" &&
+     "$(yq eval -r '.aiPlatform.profile' "$deployment")" == "cpuOnly" &&
+     "$(yq eval -r '.nodes.gpuWorkers' "$deployment")" == "0" &&
+     "$(yq eval -r '.storage.modelStaging.enabled' "$deployment")" == "false" &&
+     "$(yq eval -r '.components.kuberay' "$deployment")" == "false" &&
+     "$(yq eval -r '.components.nvidia' "$deployment")" == "false" &&
+     "$(yq eval -r '.components.monitoring' "$deployment")" == "false" &&
+     "$(yq eval -r '.components.otel' "$deployment")" == "false" &&
+     "$(yq eval -r '.components.splunkOperator' "$deployment")" == "true" &&
+     "$(yq eval -r '.components.splunkStandalone' "$deployment")" == "true" &&
+     "$(yq eval -r '.components.aiOperator' "$deployment")" == "true" &&
+     "$(yq eval -r '.components.aiPlatformCR' "$deployment")" == "true" &&
+     "$(yq eval -r '.imagePullSecrets.autoCreateECR' "$deployment")" == "false" &&
+     "$(yq eval -r '.splunk.enabled' "$deployment")" == "true" ]] ||
+    err "private mode requires a completed air-gapped cpuOnly config without GPU, Ray or model staging"
+  local features
+  features="$(yq eval -r '.aiPlatform.features[].name' "$deployment" | sort)"
+  [[ "$features" == "$(printf 'agentruntime\nslim')" ]] ||
+    err "private mode requires exactly agentruntime and slim in the deployment config"
+  [[ "$(yq eval -r '.aiPlatform.features[] | select(.name == "agentruntime") | .las.tracing.enabled' "$deployment")" == "false" ]] ||
+    err "private mode requires LAS tracing disabled"
+  local ref endpoint image_registry value
+  for ref in licenseSecretRef postgresSecretRef redisSecretRef; do
+    value="$(yq eval -r ".aiPlatform.features[] | select(.name == \"agentruntime\") | .${ref} // \"\"" "$deployment")"
+    [[ "$value" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
+      err "private mode requires a Kubernetes Secret name in agentruntime.${ref}"
+  done
+  value="$(yq eval -r '.aiPlatform.features[] | select(.name == "agentruntime") | .las.assistantId // ""' "$deployment")"
+  [[ -n "$value" && "$value" != *CHANGEME* && "$value" != *CHANGE_ME* ]] ||
+    err "private mode requires the selected LAS assistantId"
+  [[ -z "$(yq eval -r '.aiPlatform.features[] | select(.name == "agentruntime") | .las.tracing.endpoint // ""' "$deployment")" ]] ||
+    err "private mode rejects a LAS tracing endpoint"
+  image_registry="$(yq eval -r '.images.registry // ""' "$deployment")"
+  [[ -n "$image_registry" && "$image_registry" != *CHANGEME* &&
+     "$image_registry" != *CHANGE_ME* && "$image_registry" != */* ]] ||
+    err "private mode requires a completed private images.registry hostname"
+  case "$image_registry" in
+    docker.io|quay.io|ghcr.io|gcr.io|registry.k8s.io|public.ecr.aws)
+      err "private mode cannot use a public images.registry" ;;
+  esac
+  endpoint="$(yq eval -r '.storage.objectStore.endpoint // ""' "$deployment")"
+  [[ "$endpoint" == http://* || "$endpoint" == https://* ]] ||
+    err "private mode requires an explicit HTTP(S) object-store endpoint"
+  [[ "$endpoint" != *CHANGEME* && "$endpoint" != *CHANGE_ME* &&
+     "$endpoint" != *amazonaws.com* ]] ||
+    err "private mode requires a completed private object-store endpoint"
+  value="$(yq eval -r '.storage.objectStore.auth.rootUser // ""' "$deployment")"
+  [[ -n "$(yq eval -r '.storage.objectStore.bucket // ""' "$deployment")" &&
+     -n "$value" && "$value" != *CHANGEME* && "$value" != *CHANGE_ME* ]] ||
+    err "private mode requires a completed object-store bucket and access identity; supply its password only at install time"
+
+  [[ "$BUNDLE_TRANSFER_MODE" == "local-copy" || "$BUNDLE_TRANSFER_MODE" == "pre-staged" ]] ||
+    err "private mode install.bundleTransferMode must be local-copy or pre-staged"
+  [[ "$AIRGAP_BUNDLE_SHA256" =~ ^[a-fA-F0-9]{64}$ ]] ||
+    err "private mode requires install.airgapBundleSha256"
+  local workload_images expected_refs actual_sha
+  expected_refs="$(private_expected_workload_refs "$deployment" "$image_registry")"
+  if [[ "$BUNDLE_TRANSFER_MODE" == "pre-staged" ]]; then
+    [[ -z "$AIRGAP_BUNDLE_PATH" ]] ||
+      err "pre-staged mode must leave install.airgapBundlePath empty; only small evidence files belong on this host"
+    [[ "$BUNDLE_PROFILE_PATH" == /* && -f "$BUNDLE_PROFILE_PATH" &&
+       "$WORKLOAD_IMAGES_PATH" == /* && -f "$WORKLOAD_IMAGES_PATH" ]] ||
+      err "pre-staged mode requires absolute install.bundleProfilePath and install.workloadImagesPath files"
+    [[ "$(cat "$BUNDLE_PROFILE_PATH")" == "cpuOnly" ]] ||
+      err "Pre-staged bundle profile evidence must be cpuOnly"
+    workload_images="$(cat "$WORKLOAD_IMAGES_PATH")"
+    validate_private_workload_refs "$workload_images" "$expected_refs" "Pre-staged bundle evidence"
+    log "Pre-staged bundle evidence verified; installer archive SHA-256 will be checked on resume: ${AIRGAP_BUNDLE_SHA256}"
+  else
+    [[ "$AIRGAP_BUNDLE_PATH" == /* && -f "$AIRGAP_BUNDLE_PATH" ]] ||
+      err "private local-copy mode requires an absolute install.airgapBundlePath to an existing bundle"
+    actual_sha="$(file_sha256 "$AIRGAP_BUNDLE_PATH")"
+    [[ "$(printf '%s' "$actual_sha" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$AIRGAP_BUNDLE_SHA256" | tr '[:upper:]' '[:lower:]')" ]] ||
+      err "Air-gap bundle SHA-256 mismatch: expected ${AIRGAP_BUNDLE_SHA256}, got ${actual_sha}"
+    workload_images="$(private_bundle_evidence_from_archive "$AIRGAP_BUNDLE_PATH")"
+    validate_private_workload_refs "$workload_images" "$expected_refs" "Local bundle"
+    log "Private bundle verified: ${actual_sha}"
+  fi
+}
+
+# Stage only the deployment schema needed by the installer. YAML comments and
+# unrelated local fields are intentionally excluded; raw credential fields are
+# removed even after the preflight rejects nonempty values.
+write_private_deployment_config() {
+  local target="$1"
+  yq eval -o=json "$CLUSTER_CONFIG_FILE" |
+    jq '{
+      cluster, nodes, storage, images, components, kubernetes, files,
+      splunk, aiPlatform, imagePullSecrets, metallb
+    } |
+    del(.storage.objectStore.auth.rootPassword,
+        .imagePullSecrets.dockerHub.password,
+        .imagePullSecrets.acr.password,
+        .imagePullSecrets.custom.password,
+        .imagePullSecrets.gcr.jsonKey)' |
+    yq eval -P - > "$target"
+  chmod 600 "$target"
+}
+
+private_subnet_route_table() {
+  local subnet="$1" table
+  table="$(aws ec2 describe-route-tables --region "$REGION" \
+    --filters "Name=vpc-id,Values=${VPC_ID}" "Name=association.subnet-id,Values=${subnet}" \
+    --query 'RouteTables[0].RouteTableId' --output text)"
+  if [[ -z "$table" || "$table" == "None" ]]; then
+    table="$(aws ec2 describe-route-tables --region "$REGION" \
+      --filters "Name=vpc-id,Values=${VPC_ID}" "Name=association.main,Values=true" \
+      --query 'RouteTables[0].RouteTableId' --output text)"
+  fi
+  [[ -n "$table" && "$table" != "None" ]] || err "No route table found for private subnet ${subnet}"
+  echo "$table"
+}
+
+validate_private_network() {
+  [[ "$PRIVATE_MODE" == "true" ]] || return 0
+  local subnet details table routes subnet_cidr
+  for subnet in "$SUBNET_ID" "$INSTALLER_SUBNET_ID"; do
+    details="$(aws ec2 describe-subnets --region "$REGION" --subnet-ids "$subnet" --output json)" ||
+      err "Cannot inspect subnet ${subnet}"
+    jq -e --arg vpc "$VPC_ID" '.Subnets | length == 1 and .[0].VpcId == $vpc and .[0].MapPublicIpOnLaunch == false and .[0].AssignIpv6AddressOnCreation == false' \
+      <<< "$details" >/dev/null ||
+      err "Subnet ${subnet} must belong to ${VPC_ID} and auto-assign no public IPv4 or IPv6 addresses"
+    subnet_cidr="$(jq -r '.Subnets[0].CidrBlock' <<< "$details")"
+    if ! python3 - "$subnet_cidr" "$PRIVATE_EGRESS_CIDRS" <<'PY'; then
+import ipaddress
+import sys
+subnet = ipaddress.ip_network(sys.argv[1])
+allowed = [ipaddress.ip_network(value) for value in sys.argv[2].splitlines() if value]
+sys.exit(0 if any(subnet.subnet_of(cidr) for cidr in allowed) else 1)
+PY
+      err "Allowed egress CIDRs do not cover cluster subnet ${subnet} (${subnet_cidr})"
+    fi
+    table="$(private_subnet_route_table "$subnet")"
+    routes="$(aws ec2 describe-route-tables --region "$REGION" --route-table-ids "$table" --output json)"
+    jq -e '[.RouteTables[0].Routes[] | select(
+      .DestinationCidrBlock == "0.0.0.0/0" or
+      .DestinationIpv6CidrBlock == "::/0" or
+      ((.GatewayId // "") | startswith("igw-")) or
+      .NatGatewayId != null or
+      .EgressOnlyInternetGatewayId != null
+    )] | length == 0' <<< "$routes" >/dev/null ||
+      err "Subnet ${subnet} route table ${table} has an Internet/NAT path"
+    log "Private subnet verified: ${subnet}, route table ${table}"
+  done
+}
+
+require_pinned_private_hosts() {
+  [[ "$PRIVATE_MODE" == "true" ]] || return 0
+  [[ -s "$PRIVATE_KNOWN_HOSTS_FILE" ]] ||
+    err "Pinned SSH host keys missing at ${PRIVATE_KNOWN_HOSTS_FILE}; verify the new instances out of band, then run resume-setup"
+  local host name i hosts=()
+  [[ -n "${INSTALLER_PRIV_IP:-}" ]] || err "Private state is missing the installer IP"
+  hosts=("${INSTALLER_PRIV_IP}")
+  for ((i=0; i<CTRL_COUNT; i++)); do
+    name="CTRL_IP_${i}"
+    [[ -n "${!name:-}" ]] || err "Private state is missing ${name}"
+    hosts+=("${!name}")
+  done
+  for ((i=0; i<CPU_COUNT; i++)); do
+    name="CPU_IP_${i}"
+    [[ -n "${!name:-}" ]] || err "Private state is missing ${name}"
+    hosts+=("${!name}")
+  done
+  for host in "${hosts[@]}"; do
+    [[ -n "$host" ]] || continue
+    ssh-keygen -F "$host" -f "$PRIVATE_KNOWN_HOSTS_FILE" >/dev/null ||
+      err "No pinned SSH host key for ${host} in ${PRIVATE_KNOWN_HOSTS_FILE}"
+  done
+}
+
+# EC2 console output is returned by the authenticated AWS API for a specific
+# instance ID. UserData publishes only the host public key there. If console
+# output is delayed or unavailable, leave the instances in a resumable state
+# and require a separately verified known_hosts file.
+enroll_private_host_keys_from_console() {
+  [[ "$PRIVATE_MODE" == "true" ]] || return 0
+  if [[ -e "$PRIVATE_KNOWN_HOSTS_FILE" ]]; then
+    require_pinned_private_hosts
+    return 0
+  fi
+
+  local scoped_hosts id ip role i response host_key
+  scoped_hosts="$(mktemp)"
+  local ids=("${INSTALLER_INSTANCE}") ips=("${INSTALLER_PRIV_IP}") roles=("installer")
+  for ((i=0; i<CTRL_COUNT; i++)); do
+    local instance_var="CTRL_INSTANCE_${i}" ip_var="CTRL_IP_${i}"
+    ids+=("${!instance_var}"); ips+=("${!ip_var}"); roles+=("controller-${i}")
+  done
+  for ((i=0; i<CPU_COUNT; i++)); do
+    local instance_var="CPU_INSTANCE_${i}" ip_var="CPU_IP_${i}"
+    ids+=("${!instance_var}"); ips+=("${!ip_var}"); roles+=("cpu-worker-${i}")
+  done
+
+  for ((i=0; i<${#ids[@]}; i++)); do
+    id="${ids[i]}"; ip="${ips[i]}"; role="${roles[i]}"
+    host_key=""
+    local attempt
+    for ((attempt=0; attempt<18; attempt++)); do
+      response="$(aws ec2 get-console-output --region "$REGION" \
+        --instance-id "$id" --latest --output json 2>/dev/null || true)"
+      host_key="$(printf '%s' "$response" | jq -r '.Output // ""' 2>/dev/null |
+        tr -d '\r' |
+        awk '/K0S_HOST_KEY ssh-ed25519 / {
+          for (j=1; j<=NF; j++) {
+            if ($j == "K0S_HOST_KEY") { print $(j+1), $(j+2) }
+          }
+        }' | tail -1)" || true
+      [[ "$host_key" =~ ^ssh-ed25519[[:space:]][A-Za-z0-9+/=]+$ ]] && break
+      sleep 10
+    done
+    if [[ ! "$host_key" =~ ^ssh-ed25519[[:space:]][A-Za-z0-9+/=]+$ ]]; then
+      rm -f "$scoped_hosts"
+      warn "No authenticated EC2 console host key yet for ${role} (${id}); verify it separately and populate ${PRIVATE_KNOWN_HOSTS_FILE}"
+      return 1
+    fi
+    printf '%s %s\n' "$ip" "$host_key" >> "$scoped_hosts"
+  done
+
+  chmod 600 "$scoped_hosts"
+  mv "$scoped_hosts" "$PRIVATE_KNOWN_HOSTS_FILE"
+  log "Pinned ${#ids[@]} SSH host public keys from authenticated EC2 console output at ${PRIVATE_KNOWN_HOSTS_FILE}"
 }
 
 # -- Create VPC + IGW + public subnet + private subnet + NAT GW if they don't exist --
@@ -424,6 +830,17 @@ pick_subnet() {
 
 # -- RHEL 9 AMI --
 get_rhel9_ami() {
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    local details
+    details="$(aws ec2 describe-images --region "$REGION" --image-ids "$PRIVATE_AMI_ID" --output json)" ||
+      err "Cannot inspect prepared private AMI ${PRIVATE_AMI_ID}"
+    jq -e '.Images | length == 1 and .[0].State == "available" and .[0].Architecture == "x86_64"' \
+      <<< "$details" >/dev/null ||
+      err "Prepared private AMI ${PRIVATE_AMI_ID} is unavailable or not x86_64"
+    log "Prepared private AMI: ${PRIVATE_AMI_ID}"
+    echo "$PRIVATE_AMI_ID"
+    return
+  fi
   local ami
   ami=$(aws ec2 describe-images \
     --owners 309956199498 \
@@ -479,6 +896,8 @@ ensure_security_group() {
               "Name=group-name,Values=${STACK_NAME}-sg" \
     --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
   if [[ -n "$existing" && "$existing" != "None" ]]; then
+    [[ "$PRIVATE_MODE" != "true" ]] ||
+      err "Security group ${STACK_NAME}-sg already exists; private mode requires a new stackName or cleanup of the prior stack"
     SG_ID="$existing"
     log "Reusing existing security group: ${SG_ID}"
     return
@@ -491,6 +910,29 @@ ensure_security_group() {
     --vpc-id "${VPC_ID}" \
     --region "${REGION}" \
     --query 'GroupId' --output text)
+  aws ec2 create-tags --resources "${SG_ID}" \
+    --tags "Key=Name,Value=${STACK_NAME}-sg" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+    --region "${REGION}"
+  save_state "SG_ID" "${SG_ID}"
+
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    # A new VPC security group permits all outbound by default. Replace that
+    # before any instances are launched, so later route changes cannot open
+    # public egress from this stack.
+    local initial_egress
+    initial_egress="$(aws ec2 describe-security-groups --group-ids "$SG_ID" \
+      --region "$REGION" --query 'SecurityGroups[0].IpPermissionsEgress' --output json)"
+    if [[ "$initial_egress" != "[]" ]]; then
+      aws ec2 revoke-security-group-egress --group-id "$SG_ID" \
+        --ip-permissions "$initial_egress" --region "$REGION" >/dev/null
+    fi
+    local cidr
+    while IFS= read -r cidr; do
+      [[ -z "$cidr" ]] && continue
+      aws ec2 authorize-security-group-egress --group-id "$SG_ID" \
+        --protocol -1 --cidr "$cidr" --region "$REGION" >/dev/null
+    done <<< "$PRIVATE_EGRESS_CIDRS"
+  fi
 
   # Self-referencing: all intra-cluster traffic
   aws ec2 authorize-security-group-ingress \
@@ -505,9 +947,6 @@ ensure_security_group() {
     --cidr "${SSH_CIDR}" \
     --region "${REGION}" &>/dev/null
 
-  aws ec2 create-tags --resources "${SG_ID}" \
-    --tags "Key=Name,Value=${STACK_NAME}-sg" "Key=${TAG_KEY},Value=${STACK_NAME}" \
-    --region "${REGION}"
   log "Security group: ${SG_ID}"
 }
 
@@ -519,10 +958,27 @@ set -e
 echo 'ec2-user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ec2-user-nopasswd
 chmod 440 /etc/sudoers.d/ec2-user-nopasswd
 mkdir -p /home/ec2-user/.ssh
+chown -R ec2-user:ec2-user /home/ec2-user/.ssh
+chmod 700 /home/ec2-user/.ssh
+UD
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    cat <<'UD'
+# Publish only the SSH host public key to the authenticated EC2 console output.
+# The provisioner binds this key to the instance ID returned by the AWS API.
+for attempt in $(seq 1 30); do
+  [ -s /etc/ssh/ssh_host_ed25519_key.pub ] && break
+  sleep 2
+done
+if [ -s /etc/ssh/ssh_host_ed25519_key.pub ]; then
+  printf 'K0S_HOST_KEY %s\n' "$(cat /etc/ssh/ssh_host_ed25519_key.pub)" > /dev/console
+fi
+UD
+    return
+  fi
+  cat <<'UD'
 printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' \
   >> /home/ec2-user/.ssh/config
 chown -R ec2-user:ec2-user /home/ec2-user/.ssh
-chmod 700 /home/ec2-user/.ssh
 chmod 600 /home/ec2-user/.ssh/config
 UD
 }
@@ -726,6 +1182,64 @@ wait_for_ssh_via_jump() {
   echo ""; log "SSH ready: ${label} (${host})"
 }
 
+# Private instances have no public address. Their host keys must be verified
+# out of band and pinned in network.knownHostsFile before any SSH connection.
+# An optional SSH config supplies a workstation-to-installer transport (such
+# as EC2 Instance Connect Endpoint) without changing connected-mode calls.
+private_ssh() {
+  if [[ -n "$PRIVATE_SSH_CONFIG_FILE" ]]; then
+    ssh -F "$PRIVATE_SSH_CONFIG_FILE" "$@"
+  else
+    ssh "$@"
+  fi
+}
+
+private_scp() {
+  if [[ -n "$PRIVATE_SSH_CONFIG_FILE" ]]; then
+    scp -F "$PRIVATE_SSH_CONFIG_FILE" "$@"
+  else
+    scp "$@"
+  fi
+}
+
+private_jump_proxy_command() {
+  local jump="$1" config_opt="" known_opt
+  if [[ -n "$PRIVATE_SSH_CONFIG_FILE" ]]; then
+    printf -v config_opt ' -F %q' "$PRIVATE_SSH_CONFIG_FILE"
+  fi
+  printf -v known_opt '%q' "UserKnownHostsFile=${PRIVATE_KNOWN_HOSTS_FILE}"
+  printf 'ssh%s -i %q -o StrictHostKeyChecking=yes -o %s -o BatchMode=yes -o ConnectTimeout=30 -W %%h:%%p ec2-user@%q' \
+    "$config_opt" "$KEY_LOCAL" "$known_opt" "$jump"
+}
+
+wait_for_private_installer_ssh() {
+  local host="$1" timeout=600 deadline
+  deadline=$((SECONDS + timeout))
+  log "Waiting for private installer SSH on ${host}..."
+  while ! private_ssh -i "$KEY_LOCAL" -o StrictHostKeyChecking=yes \
+      -o "UserKnownHostsFile=${PRIVATE_KNOWN_HOSTS_FILE}" \
+      -o BatchMode=yes -o ConnectTimeout=30 "ec2-user@${host}" true; do
+    (( SECONDS >= deadline )) && err "Private installer SSH timed out after ${timeout}s"
+    sleep 10
+  done
+  log "Private installer SSH ready: ${host}"
+}
+
+wait_for_private_node_ssh() {
+  local jump="$1" host="$2" label="$3" timeout=600 deadline
+  deadline=$((SECONDS + timeout))
+  local proxy
+  proxy="$(private_jump_proxy_command "$jump")"
+  log "Waiting for ${label} (${host}) via private installer..."
+  while ! private_ssh -i "$KEY_LOCAL" -o "ProxyCommand=${proxy}" \
+      -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=${PRIVATE_KNOWN_HOSTS_FILE}" \
+      -o BatchMode=yes -o ConnectTimeout=30 \
+      "ec2-user@${host}" true; do
+    (( SECONDS >= deadline )) && err "Private SSH to ${label} timed out after ${timeout}s"
+    sleep 10
+  done
+}
+
 # -- Verify outbound internet access from a private node via NAT --
 # Usage: check_nat_connectivity <private_ip> <label> <jump_eip>
 # Checks endpoints that k0s install actually needs:
@@ -782,6 +1296,7 @@ command -v yq &>/dev/null || {
     "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
   sudo chmod +x /usr/local/bin/yq
 }
+
 command -v kubectl &>/dev/null || {
   K8S_VER=$(curl -sSL https://dl.k8s.io/release/stable.txt 2>/dev/null || echo v1.32.0)
   sudo curl -sSL -o /usr/local/bin/kubectl \
@@ -898,6 +1413,124 @@ SYMLINKSCRIPT
   fi
 }
 
+# The private installer starts from a prepared AMI. The selected mode either
+# copies the bundle from this host or uses a bundle copied inside the VPC;
+# installer files remain non-secret. The node key stays on the installer.
+verify_private_remote_bundle() {
+  local host="$1" expected_refs expected_refs_b64 image_registry
+  local ssh_opts=(-i "$KEY_LOCAL" -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=${PRIVATE_KNOWN_HOSTS_FILE}" -o BatchMode=yes)
+  image_registry="$(yq eval -r '.images.registry // ""' "$CLUSTER_CONFIG_FILE")"
+  expected_refs="$(private_expected_workload_refs "$CLUSTER_CONFIG_FILE" "$image_registry")"
+  expected_refs_b64="$(printf '%s' "$expected_refs" | base64 | tr -d '\n')"
+  private_ssh "${ssh_opts[@]}" "ec2-user@${host}" \
+    "bash -s -- ${AIRGAP_BUNDLE_SHA256} ${expected_refs_b64}" <<'REMOTE_BUNDLE' || err "Private installer bundle failed SHA-256, cpuOnly profile or exact workload image verification"
+set -euo pipefail
+bundle="$HOME/airgap-bundles/airgap-bundle.tar.gz"
+[[ -s "$bundle" ]] || { echo "Pre-staged bundle is missing at $bundle" >&2; exit 1; }
+actual_sha="$(sha256sum "$bundle" | awk '{print $1}')"
+[[ "$(printf '%s' "$actual_sha" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" ]] ||
+  { echo "Remote bundle SHA-256 mismatch: $actual_sha" >&2; exit 1; }
+entries="$(tar -tzf "$bundle")"
+profile_entry="$(printf '%s\n' "$entries" | awk '/^[^\/]+\/bundle-profile\.txt$/ {print}')"
+workload_entry="$(printf '%s\n' "$entries" | awk '/^[^\/]+\/images\/workload-images\.list$/ {print}')"
+[[ -n "$profile_entry" && "$profile_entry" != *$'\n'* &&
+   -n "$workload_entry" && "$workload_entry" != *$'\n'* &&
+   "${profile_entry%%/*}" == "${workload_entry%%/*}" ]] ||
+  { echo "Remote bundle profile or workload list is missing or ambiguous" >&2; exit 1; }
+[[ "$(tar -xOf "$bundle" "$profile_entry")" == "cpuOnly" ]] ||
+  { echo "Remote bundle profile is not cpuOnly" >&2; exit 1; }
+actual_refs="$(tar -xOf "$bundle" "$workload_entry" | LC_ALL=C sort -u)"
+expected_refs="$(printf '%s' "$2" | base64 -d)"
+[[ "$actual_refs" == "$expected_refs" ]] ||
+  { echo "Remote bundle workload images do not match selected CPU-only refs" >&2; exit 1; }
+printf '[k0s-provision] Remote CPU-only bundle verified: %s\n' "$actual_sha"
+REMOTE_BUNDLE
+}
+
+setup_private_installer() {
+  local host="$1" scoped_hosts staged_config name node
+  local ssh_opts=(-i "$KEY_LOCAL" -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=${PRIVATE_KNOWN_HOSTS_FILE}" -o BatchMode=yes)
+  log "Checking tools on prepared private installer ${host}..."
+  private_ssh "${ssh_opts[@]}" "ec2-user@${host}" 'bash -s' <<'PRIVATE_TOOLS'
+set -e
+for tool in yq jq kubectl helm tar ssh scp ssh-keygen sha256sum python3 curl; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "Prepared installer AMI is missing $tool" >&2
+    exit 1
+  }
+done
+mkdir -p ~/.ssh ~/cluster_setup ~/airgap-bundles
+chmod 700 ~/.ssh
+if [ ! -f ~/.ssh/k0s-node-key ]; then
+  ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/k0s-node-key
+fi
+chmod 600 ~/.ssh/k0s-node-key
+PRIVATE_TOOLS
+
+  # Copy only entries for this newly created stack, never the operator's
+  # complete known_hosts inventory.
+  scoped_hosts="$(mktemp)"
+  for node in "$INSTALLER_PRIV_IP"; do
+    ssh-keygen -F "$node" -f "$PRIVATE_KNOWN_HOSTS_FILE" | sed '/^# /d' >> "$scoped_hosts"
+  done
+  for name in $(compgen -v | grep -E '^(CTRL_IP_|CPU_IP_)' | sort); do
+    node="${!name}"
+    ssh-keygen -F "$node" -f "$PRIVATE_KNOWN_HOSTS_FILE" | sed '/^# /d' >> "$scoped_hosts"
+  done
+  chmod 600 "$scoped_hosts"
+  private_scp "${ssh_opts[@]}" "$scoped_hosts" "ec2-user@${host}:~/.ssh/known_hosts" ||
+    { rm -f "$scoped_hosts"; err "Could not stage scoped host keys on installer"; }
+  rm -f "$scoped_hosts"
+  private_ssh "${ssh_opts[@]}" "ec2-user@${host}" 'chmod 600 ~/.ssh/known_hosts'
+  private_scp "${ssh_opts[@]}" \
+    "${SCRIPT_DIR}/k0s_cluster_with_stack.sh" \
+    "${SCRIPT_DIR}/install_from_airgap_bundle.sh" \
+    "${SCRIPT_DIR}/artifacts.yaml" \
+    "${SCRIPT_DIR}/splunk-operator-cluster.yaml" \
+    "ec2-user@${host}:~/cluster_setup/"
+  staged_config="$(mktemp)"
+  write_private_deployment_config "$staged_config"
+  [[ -s "$staged_config" ]] ||
+    { rm -f "$staged_config"; err "Sanitized private deployment config is empty"; }
+  private_scp "${ssh_opts[@]}" "$staged_config" \
+    "ec2-user@${host}:~/cluster_setup/k0s-private-source.yaml" ||
+    { rm -f "$staged_config"; err "Could not stage sanitized deployment config"; }
+  rm -f "$staged_config"
+  if [[ "$BUNDLE_TRANSFER_MODE" == "local-copy" ]]; then
+    private_scp "${ssh_opts[@]}" \
+      "$AIRGAP_BUNDLE_PATH" "ec2-user@${host}:~/airgap-bundles/airgap-bundle.tar.gz"
+    log "Air-gap bundle copied from this host to private installer"
+  else
+    log "Using pre-staged bundle on installer; no bundle copy from this host"
+  fi
+  verify_private_remote_bundle "$host"
+  log "Installer files and pinned CPU-only bundle verified over private SSH"
+}
+
+authorize_private_node_key() {
+  local jump="$1" host="$2" node_pub node_pub_b64 proxy
+  node_pub="$(private_ssh -i "$KEY_LOCAL" -o StrictHostKeyChecking=yes \
+    -o "UserKnownHostsFile=${PRIVATE_KNOWN_HOSTS_FILE}" -o BatchMode=yes \
+    "ec2-user@${jump}" 'cat ~/.ssh/k0s-node-key.pub')" ||
+    err "Could not read the installer's node public key"
+  [[ "$node_pub" == ssh-ed25519\ * ]] || err "Installer node public key has an unexpected format"
+  node_pub_b64="$(printf '%s' "$node_pub" | base64 | tr -d '\n')"
+  proxy="$(private_jump_proxy_command "$jump")"
+  private_ssh -i "$KEY_LOCAL" -o "ProxyCommand=${proxy}" \
+    -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=${PRIVATE_KNOWN_HOSTS_FILE}" \
+    -o BatchMode=yes "ec2-user@${host}" \
+    "bash -s -- ${node_pub_b64}" <<'NODE_KEY'
+set -e
+umask 077
+mkdir -p ~/.ssh
+key="$(printf '%s' "$1" | base64 -d)"
+grep -Fxq -- "$key" ~/.ssh/authorized_keys 2>/dev/null ||
+  printf '%s\n' "$key" >> ~/.ssh/authorized_keys
+NODE_KEY
+}
+
 # -- MinIO install --
 install_minio() {
   local eip="$1" installer_priv_ip="$2"
@@ -1004,6 +1637,11 @@ AUTHSCRIPT
 push_k0s_config() {
   local eip="$1" installer_priv_ip="$2"
   load_state
+  local ssh_command
+  local ssh_opts=(-i "$KEY_LOCAL" -o StrictHostKeyChecking=no)
+  [[ "$PRIVATE_MODE" == "true" ]] &&
+    ssh_opts=(-i "$KEY_LOCAL" -o StrictHostKeyChecking=yes
+      -o "UserKnownHostsFile=${PRIVATE_KNOWN_HOSTS_FILE}" -o BatchMode=yes)
 
   # Build controller and worker IP arrays (newline-separated for yq)
   local ctrl_ips=() worker_ips=()
@@ -1016,11 +1654,18 @@ push_k0s_config() {
   ctrl_json=$(printf '%s\n' "${ctrl_ips[@]}" | jq -Rsc 'split("\n") | map(select(length>0))')
   worker_json=$(printf '%s\n' "${worker_ips[@]}" | jq -Rsc 'split("\n") | map(select(length>0))')
 
-  local ts ecr_registry cluster_template_path min_disk_controller min_disk_cpu min_disk_gpu template_images_json template_splunk_json template_sidecars_json
+  local ts ecr_registry cluster_template_path private_template min_disk_controller min_disk_cpu min_disk_gpu template_images_json template_splunk_json template_sidecars_json installer_node_key
   ts=$(date -Iseconds 2>/dev/null || date)
   ecr_registry=""
   [[ -n "${ECR_ACCOUNT}" ]] && ecr_registry="${ECR_ACCOUNT}.dkr.ecr.${ECR_REGION}.amazonaws.com"
+  installer_node_key="/home/ec2-user/.ssh/id_rsa"
+  [[ "$PRIVATE_MODE" == "true" ]] && installer_node_key="/home/ec2-user/.ssh/k0s-node-key"
   cluster_template_path="${SCRIPT_DIR}/${CLUSTER_CONFIG_TEMPLATE}"
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    private_template="$(mktemp)"
+    write_private_deployment_config "$private_template"
+    cluster_template_path="$private_template"
+  fi
   min_disk_controller="$(yq eval '.storage.minimumDiskSpace.controller // ""' "${cluster_template_path}" 2>/dev/null || echo "")"
   min_disk_cpu="$(yq eval '.storage.minimumDiskSpace.cpuWorker // ""' "${cluster_template_path}" 2>/dev/null || echo "")"
   min_disk_gpu="$(yq eval '.storage.minimumDiskSpace.gpuWorker // ""' "${cluster_template_path}" 2>/dev/null || echo "")"
@@ -1028,13 +1673,28 @@ push_k0s_config() {
   template_splunk_json="$(yq eval -o=json -I=0 '.splunk // {}' "${cluster_template_path}" 2>/dev/null || echo '{}')"
   template_sidecars_json="$(yq eval -o=json -I=0 '.aiPlatform.sidecars // {}' "${cluster_template_path}" 2>/dev/null || echo '{}')"
 
-  ssh -i "${KEY_LOCAL}" -o StrictHostKeyChecking=no "ec2-user@${eip}" "bash -s" <<PATCHSCRIPT
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    ssh_command=private_ssh
+  else
+    ssh_command=ssh
+  fi
+  "$ssh_command" "${ssh_opts[@]}" "ec2-user@${eip}" "bash -s" <<PATCHSCRIPT
 set -e
 TARGET="\$HOME/cluster_setup/my-k0s-config.yaml"
 BASE="\$HOME/cluster_setup/${CLUSTER_CONFIG_TEMPLATE}"
+if [[ "${PRIVATE_MODE}" == "true" ]]; then
+  BASE="\$HOME/cluster_setup/k0s-private-source.yaml"
+fi
 
-# Step 1 — ensure the file exists (use template as base if not)
-if [[ -f "\$TARGET" ]]; then
+# Step 1 — private mode always starts from its pinned template. Connected mode
+# preserves an existing generated file to keep its established behavior.
+if [[ "${PRIVATE_MODE}" == "true" ]]; then
+  if [[ -f "\$TARGET" ]]; then
+    BACKUP="\${TARGET%.yaml}.bak-${ts}.yaml"
+    cp "\$TARGET" "\$BACKUP"
+  fi
+  cp "\$BASE" "\$TARGET"
+elif [[ -f "\$TARGET" ]]; then
   BACKUP="\${TARGET%.yaml}.bak-${ts}.yaml"
   cp "\$TARGET" "\$BACKUP"
   echo "[k0s-provision] Backed up existing my-k0s-config.yaml → \$(basename \$BACKUP)"
@@ -1057,11 +1717,14 @@ fi
 yq eval -i '
   .cluster.name         = "${STACK_NAME}" |
   .cluster.region       = "${REGION}" |
-  .cluster.sshKeyPath   = "/home/ec2-user/.ssh/id_rsa" |
+  .cluster.sshKeyPath   = "${installer_node_key}" |
   .cluster.sshUser      = "ec2-user" |
   .nodes.existingIPs.controllers = ${ctrl_json} |
   .nodes.existingIPs.workers     = ${worker_json}
 ' "\$TARGET"
+if [[ "${PRIVATE_MODE}" == "true" ]]; then
+  yq eval -i '.cluster.sshKnownHostsFile = "/home/ec2-user/.ssh/known_hosts"' "\$TARGET"
+fi
 
 [[ -n "${min_disk_controller}" ]] && yq eval -i '.storage.minimumDiskSpace.controller = "'"${min_disk_controller}"'"' "\$TARGET"
 [[ -n "${min_disk_cpu}" ]] && yq eval -i '.storage.minimumDiskSpace.cpuWorker = "'"${min_disk_cpu}"'"' "\$TARGET"
@@ -1104,7 +1767,11 @@ if [[ -n "${ECR_ACCOUNT}" ]]; then
 fi
 
 # Step 3 — patch object store fields
-if [[ "${MINIO_ENABLED}" == "true" ]]; then
+if [[ "${PRIVATE_MODE}" == "true" ]]; then
+  # The completed, sanitized deployment config owns the private object store.
+  # Never patch legacy SeaweedFS credentials into it from provisioner defaults.
+  :
+elif [[ "${MINIO_ENABLED}" == "true" ]]; then
   yq eval -i '
     .storage.objectStore.type                  = "minio" |
     .storage.objectStore.bucket                = "${MINIO_BUCKET}" |
@@ -1127,6 +1794,7 @@ fi
 echo "[k0s-provision] Patched infra fields into my-k0s-config.yaml"
 echo "[k0s-provision] Run: CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml ~/cluster_setup/k0s_cluster_with_stack.sh install"
 PATCHSCRIPT
+  [[ -z "${private_template:-}" ]] || rm -f "$private_template"
 }
 
 # ============================================================
@@ -1147,7 +1815,16 @@ cmd_provision() {
     fi
   fi
 
+  # Validate all local inputs and the selected routes before creating any
+  # state or AWS resources. The host keys are pinned after instance launch.
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    validate_private_config
+    pick_subnet
+    validate_private_network
+  fi
+
   : > "${STATE_FILE}"
+  save_state "AWS_ACCOUNT_ID" "${CURRENT_AWS_ACCOUNT_ID}"
   local _PROVISION_START_TS=${SECONDS}
   local _PROVISION_START_WALL; _PROVISION_START_WALL=$(date '+%Y-%m-%d %H:%M:%S')
   log "=== k0s AWS Provisioner ==="
@@ -1166,7 +1843,6 @@ cmd_provision() {
   save_state "INSTALLER_AZ" "${INSTALLER_AZ}"
   ensure_key_pair
   ensure_security_group
-  save_state "SG_ID" "${SG_ID}"
 
   # ---------- Launch instances ----------
   local ud_k0s ud_gpu ud_installer
@@ -1248,25 +1924,27 @@ cmd_provision() {
     save_state "MINIO_VOL" "${vid}"
   fi
 
-  # ---------- Elastic IP for installer ----------
-  log "Allocating Elastic IP for installer..."
-  local eip_alloc eip
-  eip_alloc=$(aws ec2 allocate-address --domain vpc --region "${REGION}" \
-    --query 'AllocationId' --output text)
-  aws ec2 create-tags --resources "${eip_alloc}" \
-    --tags "Key=Name,Value=${STACK_NAME}-installer-eip" "Key=${TAG_KEY},Value=${STACK_NAME}" \
-    --region "${REGION}"
+  # ---------- Connected mode only: Elastic IP for installer ----------
+  if [[ "$PRIVATE_MODE" != "true" ]]; then
+    log "Allocating Elastic IP for installer..."
+    local eip_alloc eip
+    eip_alloc=$(aws ec2 allocate-address --domain vpc --region "${REGION}" \
+      --query 'AllocationId' --output text)
+    aws ec2 create-tags --resources "${eip_alloc}" \
+      --tags "Key=Name,Value=${STACK_NAME}-installer-eip" "Key=${TAG_KEY},Value=${STACK_NAME}" \
+      --region "${REGION}"
 
-  load_state
-  aws ec2 associate-address \
-    --allocation-id "${eip_alloc}" \
-    --instance-id "${INSTALLER_INSTANCE}" \
-    --region "${REGION}" &>/dev/null
-  eip=$(aws ec2 describe-addresses --allocation-ids "${eip_alloc}" \
-    --region "${REGION}" --query 'Addresses[0].PublicIp' --output text)
-  save_state "EIP_ALLOC" "${eip_alloc}"
-  save_state "EIP" "${eip}"
-  log "Installer EIP: ${eip}"
+    load_state
+    aws ec2 associate-address \
+      --allocation-id "${eip_alloc}" \
+      --instance-id "${INSTALLER_INSTANCE}" \
+      --region "${REGION}" &>/dev/null
+    eip=$(aws ec2 describe-addresses --allocation-ids "${eip_alloc}" \
+      --region "${REGION}" --query 'Addresses[0].PublicIp' --output text)
+    save_state "EIP_ALLOC" "${eip_alloc}"
+    save_state "EIP" "${eip}"
+    log "Installer EIP: ${eip}"
+  fi
 
   # ---------- Collect private IPs ----------
   load_state
@@ -1288,6 +1966,47 @@ cmd_provision() {
   load_state
   local installer_priv_ip; installer_priv_ip=$(get_private_ip "${INSTALLER_INSTANCE}")
   save_state "INSTALLER_PRIV_IP" "${installer_priv_ip}"
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    save_state "INSTALLER_HOST" "${installer_priv_ip}"
+    load_state
+    if enroll_private_host_keys_from_console; then
+      if [[ "$BUNDLE_TRANSFER_MODE" == "pre-staged" ]]; then
+        log "Private EC2 instances created without EIP or NAT provisioning; AWS-verified host keys are recorded."
+        log "Copy the pinned bundle directly inside the VPC to ec2-user@${installer_priv_ip}:~/airgap-bundles/airgap-bundle.tar.gz, then run:"
+        log "  $0 resume-setup --config ${CONFIG_FILE}"
+      else
+        log "Private EC2 instances created without EIP or NAT provisioning; finishing setup with AWS-verified host keys."
+        cmd_resume_setup
+      fi
+      return 0
+    fi
+    local pending_hosts="${STATE_FILE}.known_hosts.pending"
+    {
+      echo "# Verify each instance host public key using a trusted AWS console or SSM source."
+      echo "# Then put OpenSSH known_hosts entries for every private IP in ${PRIVATE_KNOWN_HOSTS_FILE}."
+      echo "# Do not use ssh-keyscan alone as proof of identity."
+      echo "# installer ${INSTALLER_INSTANCE} ${installer_priv_ip}"
+      local i name
+      for ((i=0; i<CTRL_COUNT; i++)); do
+        name="CTRL_INSTANCE_${i}"
+        echo "# controller ${!name} $(get_private_ip "${!name}")"
+      done
+      for ((i=0; i<CPU_COUNT; i++)); do
+        name="CPU_INSTANCE_${i}"
+        echo "# cpu-worker ${!name} $(get_private_ip "${!name}")"
+      done
+      echo "# Example: ${installer_priv_ip} ssh-ed25519 <verified-public-key>"
+    } > "$pending_hosts"
+    chmod 600 "$pending_hosts"
+    log "Private EC2 instances created without EIP or NAT provisioning."
+    log "Host-key enrollment pending. Review ${pending_hosts} and populate ${PRIVATE_KNOWN_HOSTS_FILE}."
+    if [[ "$BUNDLE_TRANSFER_MODE" == "pre-staged" ]]; then
+      log "Also copy the pinned bundle inside the VPC to ec2-user@${installer_priv_ip}:~/airgap-bundles/airgap-bundle.tar.gz."
+    fi
+    log "Then run:"
+    log "  $0 resume-setup --config ${CONFIG_FILE}"
+    return 0
+  fi
 
   # ---------- Wait for SSH ----------
   load_state
@@ -1414,14 +2133,26 @@ cmd_output() {
   echo ""
   echo "================================================================"
   echo "  SSH to installer:"
-  echo "    ssh -i ${KEY_LOCAL} ec2-user@${EIP}"
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    echo "    ssh ${PRIVATE_SSH_CONFIG_FILE:+-F ${PRIVATE_SSH_CONFIG_FILE} }-i ${KEY_LOCAL} -o UserKnownHostsFile=${PRIVATE_KNOWN_HOSTS_FILE} ec2-user@${INSTALLER_PRIV_IP}"
+  else
+    echo "    ssh -i ${KEY_LOCAL} ec2-user@${EIP}"
+  fi
   echo ""
   echo "  Auto-generated k0s config on installer:"
   echo "    ~/cluster_setup/my-k0s-config.yaml"
   echo ""
   echo "  Run install from installer:"
-  echo "    CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml \\"
-  echo "      ~/cluster_setup/k0s_cluster_with_stack.sh install"
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    echo "    Supply MINIO_ROOT_PASSWORD through a trusted, non-logged environment mechanism first."
+    echo "    ~/cluster_setup/install_from_airgap_bundle.sh \\"
+    echo "      --bundle ~/airgap-bundles/airgap-bundle.tar.gz \\"
+    echo "      --config ~/cluster_setup/my-k0s-config.yaml \\"
+    echo "      --extract-dir ~/airgap-extracted"
+  else
+    echo "    CONFIG_FILE=~/cluster_setup/my-k0s-config.yaml \\"
+    echo "      ~/cluster_setup/k0s_cluster_with_stack.sh install"
+  fi
   echo "================================================================"
 }
 
@@ -1460,6 +2191,30 @@ cmd_resume_setup() {
   check_aws_auth
   [[ ! -f "${STATE_FILE}" ]] && err "No state file found for '${STACK_NAME}'. Run 'provision' first."
   load_state
+
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    [[ -n "${AWS_ACCOUNT_ID:-}" && "$AWS_ACCOUNT_ID" == "$CURRENT_AWS_ACCOUNT_ID" ]] ||
+      err "Private state account does not match the selected AWS_PROFILE"
+    validate_private_config
+    validate_private_network
+    [[ -n "${INSTALLER_PRIV_IP:-}" ]] ||
+      err "Private state is missing INSTALLER_PRIV_IP"
+    require_pinned_private_hosts
+    wait_for_private_installer_ssh "$INSTALLER_PRIV_IP"
+    setup_private_installer "$INSTALLER_PRIV_IP"
+    local name
+    for name in $(compgen -v | grep -E '^(CTRL_IP_|CPU_IP_)' | sort); do
+      [[ -n "${!name}" ]] || continue
+      wait_for_private_node_ssh "$INSTALLER_PRIV_IP" "${!name}" "$name"
+      authorize_private_node_key "$INSTALLER_PRIV_IP" "${!name}"
+    done
+    push_k0s_config "$INSTALLER_PRIV_IP" "$INSTALLER_PRIV_IP"
+    log "Private installer setup complete. Run the staged bundle entry point:"
+    log "  ssh ${PRIVATE_SSH_CONFIG_FILE:+-F ${PRIVATE_SSH_CONFIG_FILE} }-i ${KEY_LOCAL} -o UserKnownHostsFile=${PRIVATE_KNOWN_HOSTS_FILE} ec2-user@${INSTALLER_PRIV_IP}"
+    log "  Supply MINIO_ROOT_PASSWORD to the installer process through a trusted, non-logged environment mechanism."
+    log "  cd ~/cluster_setup && ./install_from_airgap_bundle.sh --bundle ~/airgap-bundles/airgap-bundle.tar.gz --config ~/cluster_setup/my-k0s-config.yaml --extract-dir ~/airgap-extracted"
+    return 0
+  fi
 
   [[ -n "${EIP:-}" ]] || err "State file is missing EIP; cannot SSH to installer."
   [[ -n "${INSTALLER_PRIV_IP:-}" ]] || err "State file is missing INSTALLER_PRIV_IP; cannot patch object store endpoint."
@@ -1501,7 +2256,12 @@ cmd_resume_setup() {
 cmd_destroy() {
   load_config
   [[ ! -f "${STATE_FILE}" ]] && { log "No state file for '${STACK_NAME}'. Nothing to destroy."; return; }
+  check_aws_auth
   load_state
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    [[ -n "${AWS_ACCOUNT_ID:-}" && "$AWS_ACCOUNT_ID" == "$CURRENT_AWS_ACCOUNT_ID" ]] ||
+      err "Private state account does not match the selected AWS_PROFILE"
+  fi
 
   echo ""
   echo "WARNING: Permanently destroying all resources for stack '${STACK_NAME}' in ${REGION}."
@@ -1591,9 +2351,11 @@ cmd_destroy() {
 cmd_dryrun() {
   load_config
   check_aws_auth
+  validate_private_config
   AMI_ID=$(get_rhel9_ami)
   # In auto-create mode there is no VPC yet, so skip subnet lookup
   [[ "${AUTO_CREATE_NETWORK}" != "true" ]] && pick_subnet
+  validate_private_network
   local inst_az="${AZ}"
   if [[ "${AUTO_CREATE_NETWORK}" != "true" && -n "${INSTALLER_SUBNET_ID}" ]]; then
     inst_az=$(aws ec2 describe-subnets --subnet-ids "${INSTALLER_SUBNET_ID}" \
@@ -1608,10 +2370,25 @@ cmd_dryrun() {
   else
     echo "=== Dry-run: would create instances in existing VPC ${VPC_ID} ==="
     echo "  k0s nodes subnet    : ${SUBNET_ID} (${AZ}, private)"
-    echo "  Installer subnet    : ${INSTALLER_SUBNET_ID} (${inst_az}, public)"
+    if [[ "$PRIVATE_MODE" == "true" ]]; then
+      echo "  Installer subnet    : ${INSTALLER_SUBNET_ID} (${inst_az}, private)"
+    else
+      echo "  Installer subnet    : ${INSTALLER_SUBNET_ID} (${inst_az}, public)"
+    fi
   fi
   echo "  Security Group: new '${STACK_NAME}-sg' (self-ref + SSH from ${SSH_CIDR})"
-  echo "  1 Installer    : ${INST_TYPE}, ${INST_DISK}GB root (encrypted) + EIP"
+  if [[ "$PRIVATE_MODE" == "true" ]]; then
+    echo "  1 Installer    : ${INST_TYPE}, ${INST_DISK}GB root (encrypted), no public IP"
+    echo "  Egress CIDRs   : $(tr '\n' ' ' <<< "$PRIVATE_EGRESS_CIDRS")"
+    echo "  Setup gate     : pinned host keys at ${PRIVATE_KNOWN_HOSTS_FILE}"
+    echo "  Bundle transfer: ${BUNDLE_TRANSFER_MODE}"
+    echo "  Bundle SHA-256 : ${AIRGAP_BUNDLE_SHA256}"
+    if [[ "$BUNDLE_TRANSFER_MODE" == "pre-staged" ]]; then
+      echo "  Bundle handoff : copy within VPC to installer, then resume-setup verifies archive"
+    fi
+  else
+    echo "  1 Installer    : ${INST_TYPE}, ${INST_DISK}GB root (encrypted) + EIP"
+  fi
   echo "  ${CTRL_COUNT} Controller(s) : ${CTRL_TYPE}, ${CTRL_DISK}GB root (encrypted)"
   echo "  ${CPU_COUNT} CPU Worker(s)  : ${CPU_TYPE}, ${CPU_DISK}GB root (encrypted)"
   echo "  ${GPU_COUNT} GPU Worker(s)  : ${GPU_TYPE}, ${GPU_DISK}GB root (encrypted) + ${GPU_DATA_DISK}GB /var/lib/k0s"

@@ -58,6 +58,10 @@ func (r *LASReconciler) Reconcile(ctx context.Context, ai *aiv1.AIService) error
 	if ai.Spec.Feature.LAS == nil || ai.Spec.Feature.LAS.Image.Repository == "" || ai.Spec.Feature.LAS.Image.Tag == "" || ai.Spec.Feature.LAS.AssistantID == "" {
 		return r.fail(ctx, ai, "ConfigurationInvalid", errors.New("agentruntime requires las.image.repository, las.image.tag, and las.assistantId"))
 	}
+	las := ai.Spec.Feature.LAS
+	if las.NetworkMode == "airgapped" && las.Tracing != nil && las.Tracing.Enabled {
+		return r.fail(ctx, ai, "ConfigurationInvalid", errors.New("LAS tracing is not supported in airgapped mode"))
+	}
 	credentialRevision, err := r.credentialRevision(ctx, ai)
 	if err != nil {
 		return r.fail(ctx, ai, "DependenciesUnavailable", err)
@@ -337,13 +341,11 @@ func lasQueueAutoscalingValues(autoscaling *aiv1.LASQueueAutoscalingSpec) map[st
 }
 
 func applyLASTracing(values map[string]interface{}, tracing *aiv1.LASTracingSpec) {
-	if tracing == nil {
-		return
-	}
+	enabled := tracing != nil && tracing.Enabled
 	extraEnv := []map[string]interface{}{
-		{"name": "LANGSMITH_TRACING", "value": fmt.Sprintf("%t", tracing.Enabled)},
+		{"name": "LANGSMITH_TRACING", "value": fmt.Sprintf("%t", enabled)},
 	}
-	if tracing.Endpoint != "" {
+	if tracing != nil && tracing.Endpoint != "" {
 		extraEnv = append(extraEnv, map[string]interface{}{"name": "LANGSMITH_ENDPOINT", "value": tracing.Endpoint})
 	}
 	for _, workload := range []string{"apiServer", "queue"} {

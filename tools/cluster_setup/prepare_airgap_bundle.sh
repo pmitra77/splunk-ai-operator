@@ -12,6 +12,7 @@
 #   curl, helm, tar, gzip, sha256sum (or shasum on macOS)
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Versions (keep in sync with k0s_cluster_with_stack.sh) ─────────────────
 YQ_VERSION="v4.44.1"
@@ -24,17 +25,22 @@ KUBERAY_CHART_VERSION="1.2.2"
 # k0s does not pin a version in the install script (it installs latest stable).
 # Override with --k0s-version if you need a specific release.
 K0S_VERSION="${K0S_VERSION:-latest}"
+PYYAML_VERSION="${PYYAML_VERSION:-}"
 
 # Target OS for GPU node RPM packages. Only rhel9 is tested and supported.
 # rhel10 and amzn2023 code paths are kept for internal testing only.
 GPU_NODE_OS="${GPU_NODE_OS:-rhel9}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle}"
+CLUSTER_CONFIG=""
+CPU_ONLY_BUNDLE=false
+LOCAL_PATH_HELPER_IMAGE="docker.io/library/busybox:1.36.1"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir)  OUTPUT_DIR="$2"; shift 2 ;;
+    --config)      CLUSTER_CONFIG="$2"; shift 2 ;;
     --k0s-version) K0S_VERSION="$2"; shift 2 ;;
     --gpu-os)      GPU_NODE_OS="$2"; shift 2 ;;
     -h|--help)
@@ -49,6 +55,12 @@ OPTIONS
   --output-dir DIR      Directory where the bundle is written.
                         Default: ./airgap-bundle
                         Env: OUTPUT_DIR
+
+  --config FILE         CPU-only air-gap cluster config. Bundle its exact
+                        Splunk, operator, SLIM and LAS images and the matching
+                        installer sources. Omit full-profile charts/GPU files.
+                        Requires --k0s-version and PYYAML_VERSION to pin
+                        the remaining downloaded artifacts.
 
   --k0s-version VER     Specific k0s release to download (e.g. v1.31.2+k0s.0).
                         Default: latest stable release
@@ -88,6 +100,10 @@ WHAT IS BUNDLED
   container-images.txt  — List of container images to mirror to your internal registry
   bundle-versions.txt   — Records all component versions for reproducibility
   checksums.sha256      — SHA-256 checksums for every file in the bundle
+
+  With --config, bundle-profile.txt selects cpuOnly and cluster_setup/
+  contains the exact installer, helper, CRD and operator manifests. Prometheus,
+  OpenTelemetry, KubeRay, MetalLB and NVIDIA assets are omitted.
 
 ENVIRONMENT VARIABLE OVERRIDES (set before running the installer manually)
   These are exported automatically by install_from_airgap_bundle.sh.
@@ -148,12 +164,17 @@ HELP
   esac
 done
 
+if [[ -n "${CLUSTER_CONFIG}" && ! -f "${CLUSTER_CONFIG}" ]]; then
+  echo "ERROR: cluster config not found: ${CLUSTER_CONFIG}" >&2
+  exit 1
+fi
+
 BUNDLE_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BUNDLE_NAME="airgap-bundle-${BUNDLE_TIMESTAMP}"
 STAGE_DIR="${OUTPUT_DIR}/${BUNDLE_NAME}"
 
 # ── OS validation ─────────────────────────────────────────────────────────────
-if [[ "${GPU_NODE_OS}" != "rhel9" ]]; then
+if [[ -z "${CLUSTER_CONFIG}" && "${GPU_NODE_OS}" != "rhel9" ]]; then
   echo "ERROR: --gpu-os '${GPU_NODE_OS}' is not supported." >&2
   echo "  Only 'rhel9' is tested and supported for GPU node packages." >&2
   echo "  rhel10 and amzn2023 paths exist in the code for internal testing" >&2
@@ -188,10 +209,40 @@ download() {
   fi
 }
 
+# k0s bundle-artifacts emits an OCI Image Layout archive. Check the archive's
+# actual named references instead of trusting only the input image list.
+verify_oci_bundle_refs() {
+  local archive="$1" list="$2" index refs expected canonical first
+  [[ -s "${archive}" && -s "${list}" ]] || err "Missing OCI archive or image list: ${archive}"
+  index="$(tar -xOf "${archive}" index.json 2>/dev/null)" ||
+    index="$(tar -xOf "${archive}" ./index.json 2>/dev/null)" ||
+    err "OCI index.json missing from ${archive}"
+  refs="$(printf '%s' "${index}" |
+    "${STAGE_DIR}/binaries/yq" eval -r '.manifests[] | .annotations."org.opencontainers.image.ref.name" // .annotations."io.containerd.image.name" // ""' -)" ||
+    err "Cannot read OCI references in ${archive}"
+  while IFS= read -r expected; do
+    [[ -z "${expected}" ]] && continue
+    canonical="${expected}"
+    first="${expected%%/*}"
+    if [[ "${expected}" != */* ]]; then
+      canonical="docker.io/library/${expected}"
+    elif [[ "${first}" != *.* && "${first}" != *:* && "${first}" != "localhost" ]]; then
+      canonical="docker.io/${expected}"
+    fi
+    grep -Fxq -- "${expected}" <<< "${refs}" ||
+      grep -Fxq -- "${canonical}" <<< "${refs}" ||
+      err "OCI archive ${archive} is missing image ${expected}"
+  done < "${list}"
+}
+
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 require_cmd curl
 require_cmd helm
 require_cmd tar
+if [[ -n "${CLUSTER_CONFIG}" ]]; then
+  [[ "${K0S_VERSION}" != "latest" && -n "${PYYAML_VERSION}" ]] ||
+    err "CPU-only bundle requires --k0s-version and PYYAML_VERSION"
+fi
 
 log "=== Splunk AI Platform — Air-Gap Bundle Preparation ==="
 log "Output directory : ${OUTPUT_DIR}"
@@ -258,6 +309,15 @@ YQ_URL="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux
 download "${YQ_URL}" "${STAGE_DIR}/binaries/yq"
 chmod +x "${STAGE_DIR}/binaries/yq"
 
+if [[ -n "${CLUSTER_CONFIG}" ]]; then
+  profile="$("${STAGE_DIR}/binaries/yq" eval -r '.aiPlatform.profile // ""' "${CLUSTER_CONFIG}")"
+  airgap="$("${STAGE_DIR}/binaries/yq" eval -r '.cluster.airgap // false' "${CLUSTER_CONFIG}")"
+  [[ "${profile}" == "cpuOnly" && "${airgap}" == "true" ]] ||
+    err "--config requires aiPlatform.profile: cpuOnly and cluster.airgap: true"
+  CPU_ONLY_BUNDLE=true
+  printf 'cpuOnly\n' > "${STAGE_DIR}/bundle-profile.txt"
+fi
+
 # ── 3. Static Kubernetes manifests ────────────────────────────────────────────
 log "--- Downloading static manifests ---"
 
@@ -269,12 +329,28 @@ download \
   "https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_PROVISIONER_VERSION}/deploy/local-path-storage.yaml" \
   "${STAGE_DIR}/manifests/local-path-storage.yaml"
 
+if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+  # The upstream helperPod ConfigMap uses bare busybox, which means a mutable
+  # latest tag. Apply the same fixed image reference that the bundle imports.
+  local_path_manifest="${STAGE_DIR}/manifests/local-path-storage.yaml"
+  [[ "$(grep -Ec '^[[:space:]]*image:[[:space:]]*busybox[[:space:]]*$' "${local_path_manifest}")" == "1" ]] ||
+    err "Expected exactly one local-path helper image to pin"
+  sed -E "s@^([[:space:]]*image:[[:space:]]*)busybox[[:space:]]*\$@\\1${LOCAL_PATH_HELPER_IMAGE}@" \
+    "${local_path_manifest}" > "${local_path_manifest}.tmp"
+  mv "${local_path_manifest}.tmp" "${local_path_manifest}"
+else
 download \
   "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/${NVIDIA_DEVICE_PLUGIN_VERSION}/deployments/static/nvidia-device-plugin.yml" \
   "${STAGE_DIR}/manifests/nvidia-device-plugin.yml"
+fi
 
 # ── 4. Helm charts ────────────────────────────────────────────────────────────
 log "--- Pulling Helm charts ---"
+PROMETHEUS_CHART_VERSION=""
+OTEL_CHART_VERSION=""
+if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+  log "CPU-only profile: no Prometheus, OpenTelemetry, KubeRay, or MetalLB charts"
+else
 
 # Add repos
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
@@ -312,6 +388,7 @@ helm pull kuberay/kuberay-operator \
 helm pull metallb/metallb \
   --version "${METALLB_CHART_VERSION}" \
   --destination "${STAGE_DIR}/charts"
+fi
 
 # ── 4b. Add-on component image bundle ──────────────────────────────────────────
 # The add-on components (cert-manager, local-path, kube-prometheus-stack, otel,
@@ -350,8 +427,10 @@ ADDON_LIST="${STAGE_DIR}/images/addon-images.list"
         | sed -E 's/image:[[:space:]]*["'"'"']?//' || true
     done
   fi
-  # busybox:latest (otel init) — pin a concrete tag so it resolves offline.
-  echo "busybox:latest"
+  if [[ "${CPU_ONLY_BUNDLE}" != "true" ]]; then
+    # Preserve the legacy full-profile bundle's unqualified helper image.
+    echo "busybox:latest"
+  fi
 } | grep -E '[:/]' | grep -vE '^busybox$' | sort -u > "${ADDON_LIST}"
 
 if [[ -s "${ADDON_LIST}" ]]; then
@@ -367,6 +446,47 @@ else
   warn "Could not enumerate any add-on images from charts/manifests — add-on pods may fail to pull on air-gapped nodes."
 fi
 
+# A selected CPU-only install also needs the product images. The generic
+# static list below is advisory; this list is derived from the exact config
+# that will be installed and bundled under those exact image references.
+if [[ -n "${CLUSTER_CONFIG}" ]]; then
+  bundle_yq="${STAGE_DIR}/binaries/yq"
+  profile="$("${bundle_yq}" eval -r '.aiPlatform.profile // ""' "${CLUSTER_CONFIG}")"
+  airgap="$("${bundle_yq}" eval -r '.cluster.airgap // false' "${CLUSTER_CONFIG}")"
+  [[ "${profile}" == "cpuOnly" && "${airgap}" == "true" ]] || \
+    err "--config requires aiPlatform.profile: cpuOnly and cluster.airgap: true"
+  WORKLOAD_LIST="${STAGE_DIR}/images/workload-images.list"
+  : > "${WORKLOAD_LIST}"
+  for expression in \
+    '.images.operator.image' \
+    '.images.splunk.image' \
+    '.images.splunk.operatorImage' \
+    '.images.slim.apiImage'; do
+    image="$("${bundle_yq}" eval -r "${expression} // \"\"" "${CLUSTER_CONFIG}")"
+    [[ -n "${image}" && "${image}" != "null" && "${image}" != *'<'* ]] || \
+      err "Missing or placeholder workload image at ${expression}"
+    echo "${image}" >> "${WORKLOAD_LIST}"
+  done
+  las_repository="$("${bundle_yq}" eval -r '.aiPlatform.features[] | select(.name == "agentruntime") | .las.image.repository' "${CLUSTER_CONFIG}")"
+  las_tag="$("${bundle_yq}" eval -r '.aiPlatform.features[] | select(.name == "agentruntime") | .las.image.tag' "${CLUSTER_CONFIG}")"
+  [[ -n "${las_repository}" && "${las_repository}" != "null" && "${las_repository}" != *'<'* &&
+     -n "${las_tag}" && "${las_tag}" != "null" && "${las_tag}" != *'<'* ]] || \
+    err "Missing or placeholder Agent Runtime image repository/tag"
+  echo "${las_repository}:${las_tag}" >> "${WORKLOAD_LIST}"
+  sort -u "${WORKLOAD_LIST}" -o "${WORKLOAD_LIST}"
+  log "Building selected CPU-only workload image bundle from ${CLUSTER_CONFIG}..."
+  "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+    -o "${STAGE_DIR}/images/workload-images.tar" < "${WORKLOAD_LIST}" \
+    || err "Failed to bundle selected CPU-only workload images"
+fi
+
+if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+  for kind in k0s addon workload; do
+    verify_oci_bundle_refs "${STAGE_DIR}/images/${kind}-images.tar" \
+                           "${STAGE_DIR}/images/${kind}-images.list"
+  done
+fi
+
 # ── 5. GPU node OS packages ───────────────────────────────────────────────────
 # These files are SCPed to GPU nodes by install_from_airgap_bundle.sh before
 # the main installer runs so the nodes can install dependencies without internet.
@@ -379,6 +499,8 @@ fi
 #    Without a local mirror, the .repo file still points at NVIDIA's servers.
 #  - nvidia-container-toolkit .repo: same pattern.
 #  - PyYAML wheel: pure-Python, installed offline via pip3 --no-index.
+EPEL_MAJOR=""
+if [[ "${CPU_ONLY_BUNDLE}" != "true" ]]; then
 log "--- Downloading GPU node OS packages (target OS: ${GPU_NODE_OS}) ---"
 
 # Resolve EPEL major from GPU_NODE_OS
@@ -412,6 +534,9 @@ download "${CUDA_REPO_FILE_URL}" "${STAGE_DIR}/packages/${CUDA_REPO_FILENAME}"
 # nvidia-container-toolkit RPM repo definition (text file)
 CTK_REPO_URL="https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo"
 download "${CTK_REPO_URL}" "${STAGE_DIR}/packages/nvidia-container-toolkit.repo"
+else
+  log "CPU-only profile: skipping EPEL, CUDA, NVIDIA and GPU node packages"
+fi
 
 # PyYAML — fetched from PyPI so the nodes can install it without pip's network
 # access (avoids requiring pip on the bundle machine). PyYAML does NOT publish a
@@ -423,10 +548,12 @@ download "${CTK_REPO_URL}" "${STAGE_DIR}/packages/nvidia-container-toolkit.repo"
 #
 # Each grep is guarded with `|| true`: a no-match returns exit 1, which under
 # `set -euo pipefail` would otherwise abort the whole script mid-resolution.
-log "Resolving PyYAML download URL from PyPI..."
-PYYAML_VERSION="$(curl -fsSL https://pypi.org/pypi/PyYAML/json \
-  | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
-[[ -z "${PYYAML_VERSION}" ]] && err "Could not resolve latest PyYAML version from PyPI."
+if [[ -z "${PYYAML_VERSION}" ]]; then
+  log "Resolving PyYAML version from PyPI..."
+  PYYAML_VERSION="$(curl -fsSL https://pypi.org/pypi/PyYAML/json \
+    | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+fi
+[[ -n "${PYYAML_VERSION}" ]] || err "Could not resolve PyYAML version from PyPI."
 
 PYYAML_META="$(curl -fsSL "https://pypi.org/pypi/PyYAML/${PYYAML_VERSION}/json")" \
   || err "Could not fetch PyPI metadata for PyYAML ${PYYAML_VERSION}."
@@ -448,7 +575,11 @@ PYYAML_FILENAME="$(basename "${PYYAML_WHEEL_URL}")"
 download "${PYYAML_WHEEL_URL}" "${STAGE_DIR}/packages/${PYYAML_FILENAME}"
 echo "${PYYAML_FILENAME}" > "${STAGE_DIR}/packages/pyyaml.filename"
 
-log "GPU node packages downloaded to ${STAGE_DIR}/packages/"
+if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+  log "Offline PyYAML package saved to ${STAGE_DIR}/packages/"
+else
+  log "GPU node packages downloaded to ${STAGE_DIR}/packages/"
+fi
 
 # ── 6. Env-var override manifest ──────────────────────────────────────────────
 log "--- Writing env-var override manifest ---"
@@ -471,12 +602,13 @@ export YQ_DOWNLOAD_URL="file://${AIRGAP_BUNDLE_DIR}/binaries/yq"
 
 export CERT_MANAGER_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/cert-manager.yaml"
 export LOCAL_PATH_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/local-path-storage.yaml"
-export NVIDIA_DEVICE_PLUGIN_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/nvidia-device-plugin.yml"
-
-export PROMETHEUS_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kube-prometheus-stack-$(cat "${AIRGAP_BUNDLE_DIR}/charts/kube-prometheus-stack.version").tgz"
-export OTEL_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator-$(cat "${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator.version").tgz"
-export KUBERAY_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kuberay-operator-${KUBERAY_CHART_VERSION:-1.2.2}.tgz"
-export METALLB_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/metallb-${METALLB_CHART_VERSION:-0.14.8}.tgz"
+if [[ ! -f "${AIRGAP_BUNDLE_DIR}/bundle-profile.txt" ]]; then
+  export NVIDIA_DEVICE_PLUGIN_MANIFEST_URL="file://${AIRGAP_BUNDLE_DIR}/manifests/nvidia-device-plugin.yml"
+  export PROMETHEUS_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kube-prometheus-stack-$(cat "${AIRGAP_BUNDLE_DIR}/charts/kube-prometheus-stack.version").tgz"
+  export OTEL_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator-$(cat "${AIRGAP_BUNDLE_DIR}/charts/opentelemetry-operator.version").tgz"
+  export KUBERAY_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/kuberay-operator-${KUBERAY_CHART_VERSION:-1.2.2}.tgz"
+  export METALLB_CHART_PATH="${AIRGAP_BUNDLE_DIR}/charts/metallb-${METALLB_CHART_VERSION:-0.14.8}.tgz"
+fi
 
 # GPU node OS packages — used by install_from_airgap_bundle.sh to SCP packages
 # to each GPU node before the main installer runs.
@@ -554,12 +686,49 @@ docker.io/library/nginx:1.27-alpine
 #         pii-classifier, uae-large, xlm-roberta-language-classifier
 IMGEOF
 
+if [[ -n "${CLUSTER_CONFIG}" ]]; then
+  cp "${WORKLOAD_LIST}" "${STAGE_DIR}/container-images.txt"
+fi
+
+if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+  # Keep the executable and the CRDs/manifests in the same checked-in source
+  # revision as the image list. The private installer must use these copies.
+  mkdir -p "${STAGE_DIR}/cluster_setup"
+  for source_file in k0s_cluster_with_stack.sh install_from_airgap_bundle.sh \
+                     artifacts.yaml splunk-operator-cluster.yaml las_deployment.py; do
+    [[ -s "${SCRIPT_DIR}/${source_file}" ]] || err "Missing installer source: ${source_file}"
+    cp "${SCRIPT_DIR}/${source_file}" "${STAGE_DIR}/cluster_setup/${source_file}"
+  done
+  # The lean profile does not install Prometheus Operator CRDs. Its operator
+  # manifest must therefore omit the ServiceMonitor custom resource.
+  operator_manifest="${STAGE_DIR}/cluster_setup/artifacts.yaml"
+  [[ "$(grep -Ec '^kind: ServiceMonitor$' "${operator_manifest}")" == "1" ]] ||
+    err "Expected one ServiceMonitor in the operator manifest"
+  "${STAGE_DIR}/binaries/yq" eval 'select(.kind != "ServiceMonitor")' \
+    "${operator_manifest}" > "${operator_manifest}.tmp" ||
+    err "Could not render monitoring-free operator manifest"
+  mv "${operator_manifest}.tmp" "${operator_manifest}"
+  ! grep -q '^kind: ServiceMonitor$' "${operator_manifest}" ||
+    err "CPU-only operator manifest still contains a ServiceMonitor"
+  # The Splunk Operator's shipped Deployment forces a network pull even when
+  # its exact image reference was already imported into local containerd.
+  splunk_manifest="${STAGE_DIR}/cluster_setup/splunk-operator-cluster.yaml"
+  [[ "$(grep -Ec '^[[:space:]]*imagePullPolicy: Always$' "${splunk_manifest}")" == "1" ]] ||
+    err "Expected one Always pull policy in the Splunk Operator manifest"
+  sed -E 's/^([[:space:]]*imagePullPolicy: )Always$/\1IfNotPresent/' \
+    "${splunk_manifest}" > "${splunk_manifest}.tmp"
+  mv "${splunk_manifest}.tmp" "${splunk_manifest}"
+  chmod +x "${STAGE_DIR}/cluster_setup/k0s_cluster_with_stack.sh" \
+           "${STAGE_DIR}/cluster_setup/install_from_airgap_bundle.sh"
+fi
+
 # ── 8. Write version manifest ─────────────────────────────────────────────────
 cat > "${STAGE_DIR}/bundle-versions.txt" <<VEOF
 k0s_version=${K0S_VERSION}
 yq_version=${YQ_VERSION}
 cert_manager_version=${CERT_MANAGER_VERSION}
 local_path_provisioner_version=${LOCAL_PATH_PROVISIONER_VERSION}
+pyyaml_version=${PYYAML_VERSION}
 nvidia_device_plugin_version=${NVIDIA_DEVICE_PLUGIN_VERSION}
 metallb_chart_version=${METALLB_CHART_VERSION}
 kuberay_chart_version=${KUBERAY_CHART_VERSION}
@@ -594,17 +763,23 @@ log "  Size : ${BUNDLE_SIZE}"
 log "  SHA256: ${BUNDLE_SHA}"
 log ""
 log "Next steps:"
-log "  1. Mirror the container images listed in:"
-log "       ${STAGE_DIR}/container-images.txt"
-log "     to your internal registry. Update images.* in your cluster config."
-log ""
-log "  2. Stage model weights (if not already staged) on an internet-connected"
-log "     machine using: tools/artifacts_download_upload_scripts/"
-log ""
-log "  3. Copy ${BUNDLE_TARBALL} to the air-gapped install machine."
-log ""
-log "  4. On the install machine, run:"
-log "       ./install_from_airgap_bundle.sh --bundle ${BUNDLE_NAME}.tar.gz"
+if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+  log "  1. Copy ${BUNDLE_TARBALL} and the matching private config to the installer."
+  log "  2. Copy this revision's install_from_airgap_bundle.sh wrapper."
+  log "  3. Run the wrapper with --bundle and --config; keep public egress denied."
+else
+  log "  1. Mirror the container images listed in:"
+  log "       ${STAGE_DIR}/container-images.txt"
+  log "     to your internal registry. Update images.* in your cluster config."
+  log ""
+  log "  2. Stage model weights (if not already staged) on an internet-connected"
+  log "     machine using: tools/artifacts_download_upload_scripts/"
+  log ""
+  log "  3. Copy ${BUNDLE_TARBALL} to the air-gapped install machine."
+  log ""
+  log "  4. On the install machine, run:"
+  log "       ./install_from_airgap_bundle.sh --bundle ${BUNDLE_NAME}.tar.gz"
+fi
 log ""
 log "Cleaning up staging directory..."
 rm -rf "${STAGE_DIR}"

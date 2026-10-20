@@ -78,6 +78,38 @@ func TestBuildAIService_PopulatesExpectedFields(t *testing.T) {
 	assert.Equal(t, "feature1", service.Labels["feature"])
 }
 
+func TestReconcileFeatures_CPUOnlySlimServiceAccountDoesNotOscillate(t *testing.T) {
+	ctx := context.Background()
+	scheme := buildTestScheme(t)
+	platform := &aiApi.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-ai", Namespace: "default", UID: types.UID("platform-uid")},
+		Spec: aiApi.AIPlatformSpec{
+			Profile:       aiApi.AIPlatformProfileCPUOnly,
+			Features:      []aiApi.FeatureSpec{{Name: "slim", Version: "1.0.0"}},
+			ObjectStorage: aiApi.ObjectStorageSpec{Path: "s3://fixture/tasks"},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(platform).
+		WithIndex(&aiApi.AIService{}, ownerKey, func(obj client.Object) []string {
+			if owner := metav1.GetControllerOfNoCopy(obj); owner != nil {
+				return []string{string(owner.UID)}
+			}
+			return nil
+		}).Build()
+	r := &AIPlatformReconciler{Client: fakeClient, Scheme: scheme}
+	require.NoError(t, r.ReconcileFeatures(ctx, platform))
+
+	child := &aiApi.AIService{}
+	key := types.NamespacedName{Name: "my-ai-slim", Namespace: "default"}
+	require.NoError(t, fakeClient.Get(ctx, key, child))
+	require.Equal(t, "my-ai-slim-sa", child.Spec.ServiceAccountName)
+	firstVersion := child.ResourceVersion
+
+	require.NoError(t, r.ReconcileFeatures(ctx, platform))
+	require.NoError(t, fakeClient.Get(ctx, key, child))
+	require.Equal(t, firstVersion, child.ResourceVersion, "unchanged parent must not rewrite the SLIM child")
+}
+
 func TestBuildAIService_PropagatesServiceTemplate(t *testing.T) {
 	// Customers configure public exposure (NodePort / LoadBalancer) at the
 	// AIPlatform level. Without propagation, the setting is silently dropped

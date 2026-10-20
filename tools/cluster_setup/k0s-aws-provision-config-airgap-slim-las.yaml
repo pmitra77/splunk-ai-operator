@@ -1,0 +1,62 @@
+# AWS private-egress test cluster for Splunk, SLIM and Agent Runtime.
+# This is intentionally incomplete and fails preflight until every CHANGE_ME
+# and absolute local path has been replaced. Keep the completed cluster config
+# and bundle evidence outside Git. The full bundle is copied inside the VPC
+# directly to the installer before resume-setup. No account, VPC, subnet or
+# credentials are assumed.
+stackName: airgap-slim-las-test
+region: us-west-2
+availabilityZone: us-west-2a
+sshAllowedCidr: "CHANGE_ME/32" # Trusted private SSH source only.
+
+network:
+  mode: private
+  vpcId: "vpc-CHANGE_ME"
+  subnetId: "subnet-CHANGE_ME" # Controller and CPU worker; no public route.
+  installerSubnetId: "subnet-CHANGE_ME" # Reachable through private SSH.
+  allowedEgressCidrs:
+    - "CHANGE_ME/24" # Approved private services and cluster peers.
+  knownHostsFile: "/absolute/path/to/airgap-slim-las-test.known_hosts"
+  # Optional workstation SSH config for an EC2 Instance Connect Endpoint or
+  # other approved private transport to the installer. The worker jump hop
+  # uses this same file. Leave empty when direct private SSH is available.
+  sshConfigFile: ""
+
+ami:
+  id: "ami-CHANGE_ME" # Prepared x86_64 image with offline node prerequisites.
+
+keyPair:
+  name: "" # Provisioner creates a per-stack EC2 key pair if blank.
+  localPath: "/absolute/path/to/airgap-slim-las-test.pem"
+
+nodes:
+  controller:
+    count: 1
+    instanceType: m6i.2xlarge
+    diskGb: 300 # At least the prepared AMI's 300-GiB root snapshot.
+  cpuWorker:
+    count: 1
+    instanceType: m6i.4xlarge
+    diskGb: 350
+  gpuWorker:
+    count: 0
+
+installer:
+  instanceType: t3.large
+  diskGb: 300
+
+minio:
+  enabled: false # Test dependencies are installed separately on a private host.
+
+install:
+  clusterConfigFile: "/absolute/path/to/completed-airgap-slim-las-config.yaml"
+  bundleTransferMode: pre-staged # Omit for the existing local-copy behavior.
+  airgapBundlePath: "" # Pre-stage the archive directly on the private installer.
+  airgapBundleSha256: "CHANGE_ME"
+  bundleProfilePath: "/absolute/path/to/bundle-profile.txt" # Small nonsecret evidence.
+  workloadImagesPath: "/absolute/path/to/workload-images.list" # Small nonsecret evidence.
+  modelStaging:
+    enabled: false
+
+ecr:
+  account: "" # All images must be in the offline bundle.

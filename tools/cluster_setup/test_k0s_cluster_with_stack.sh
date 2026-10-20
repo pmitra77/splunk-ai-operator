@@ -130,13 +130,11 @@ aiPlatform:
             targetCPUUtilizationPercentage: 80
         credentials:
           postgresConnectionUrl: DO_NOT_RENDER_POSTGRES_URL
-          langsmithApiKey: DO_NOT_RENDER_LANGSMITH_KEY
 YAML
 _las_rendered=$(render_las_feature_yaml "${_las_tmpdir}/config.yaml" 0 airgapped)
 assert_eq "effective air-gapped mode is rendered" "1" "$(grep -c 'networkMode: airgapped' <<<"${_las_rendered}" || true)"
 assert_eq "queue CPU and autoscaling settings are rendered" "1" "$(grep -c 'targetCPUUtilizationPercentage: 80' <<<"${_las_rendered}" || true)"
 assert_eq "raw PostgreSQL credential is excluded" "0" "$(grep -c 'DO_NOT_RENDER_POSTGRES_URL' <<<"${_las_rendered}" || true)"
-assert_eq "raw LangSmith key is excluded" "0" "$(grep -c 'DO_NOT_RENDER_LANGSMITH_KEY' <<<"${_las_rendered}" || true)"
 {
   printf 'spec:\n  features:\n    - name: agentruntime\n'
   # Match the installer concatenation: command substitution strips the renderer's
@@ -149,7 +147,7 @@ assert_eq "following feature field remains valid YAML" "fixture-sa" "$(yq eval -
 _las_refs=$(render_las_secret_refs "${_las_tmpdir}/config.yaml" 0 true '{"managed":true,"licenseSecretRef":"las-auth-generated","postgresSecretRef":"las-postgres-generated","redisSecretRef":"las-redis-generated"}')
 assert_eq "managed license Secret reference replaces legacy ref" "1" "$(grep -c 'licenseSecretRef: \"las-auth-generated\"' <<<"${_las_refs}" || true)"
 assert_eq "managed dependency Secret references are rendered" "2" "$(grep -Ec 'SecretRef: \"las-(postgres|redis)-generated\"' <<<"${_las_refs}" || true)"
-assert_eq "managed Secret references never render credential values" "0" "$(grep -Ec 'DO_NOT_RENDER_POSTGRES_URL|DO_NOT_RENDER_LANGSMITH_KEY' <<<"${_las_refs}" || true)"
+assert_eq "managed Secret references never render credential values" "0" "$(grep -c 'DO_NOT_RENDER_POSTGRES_URL' <<<"${_las_refs}" || true)"
 {
   printf 'spec:\n  features:\n    - name: agentruntime\n'
   printf '%s' "${_las_refs}"$'\n'

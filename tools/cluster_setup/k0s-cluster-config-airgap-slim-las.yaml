@@ -1,0 +1,108 @@
+# Private AWS test cluster: Splunk, SLIM, and Agent Runtime only.
+# The AWS provisioner fills the node addresses and SSH settings. Stage every
+# selected image in the offline bundle and record its manifest digest. ECR
+# tags in this account are mutable; pin the resulting bundle by SHA-256.
+# The POC LAS image is selected for MPR-63; ECR must resolve through private
+# VPC endpoints. Verify its recorded digest before creating the bundle.
+# Keep credentials in Kubernetes Secrets or a private generated config; never
+# commit them to this template.
+cluster:
+  name: airgap-slim-las
+  region: "" # Fill from the approved private-cluster inventory.
+  useExisting: never
+  sshKeyPath: ""
+  sshKnownHostsFile: "" # Provisioner stages only verified node host keys here.
+  sshUser: ec2-user
+  airgap: true
+nodes:
+  controllers: 1
+  cpuWorkers: 1
+  gpuWorkers: 0
+  existingIPs:
+    controllers: []
+    workers: []
+storage:
+  storageClass: local-path
+  minimumDiskSpace:
+    controller: 30
+    cpuWorker: 30
+    gpuWorker: 0
+  modelStaging:
+    enabled: false
+  objectStore:
+    type: minio
+    bucket: ai-platform
+    endpoint: "" # Private S3-compatible endpoint reachable from the VPC.
+    auth:
+      rootUser: ""
+      rootPassword: ""
+images:
+  registry: "" # Private registry reachable through the approved VPC endpoints.
+  registryInsecure: false
+  operator:
+    image: ""
+  splunk:
+    image: ""
+    operatorImage: ""
+  slim:
+    apiImage: ""
+imagePullSecrets:
+  autoCreateECR: false
+components:
+  certManager: true
+  monitoring: false
+  otel: false
+  kuberay: false
+  nvidia: false
+  splunkOperator: true
+  splunkStandalone: true
+  metallb: false
+  aiOperator: true
+  aiPlatformCR: true
+kubernetes:
+  namespace: ai-platform
+files:
+  splunkOperator: ./splunk-operator-cluster.yaml
+  aiPlatform: ./artifacts.yaml
+splunk:
+  enabled: true
+  standaloneName: splunk-standalone
+  trustedIssuers: []
+aiPlatform:
+  name: airgap-slim-las
+  profile: cpuOnly
+  sidecars:
+    envoy: false
+    otel: false
+    prometheusOperator: false
+  features:
+    - name: slim
+      version: "1.0.0"
+    - name: agentruntime
+      provider: mltk
+      version: "0.1.0"
+      licenseSecretRef: las-auth
+      postgresSecretRef: las-postgres
+      redisSecretRef: las-redis
+      las:
+        image:
+          repository: "" # Fill with the approved POC Agent Server repository.
+          tag: "" # Record and verify its immutable manifest digest separately.
+        assistantId: echo
+        tracing:
+          enabled: false
+        api:
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+        queue:
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          autoscaling:
+            enabled: false
+            minReplicas: 1
+            maxReplicas: 1
+            targetCPUUtilizationPercentage: 80

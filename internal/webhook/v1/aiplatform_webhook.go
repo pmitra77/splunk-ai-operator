@@ -84,7 +84,7 @@ func (d *AIPlatformCustomDefaulter) Default(_ context.Context, obj runtime.Objec
 	// This allows users to disable sidecars by setting them to false
 
 	// Default Storage size for VectorDB if not specified
-	if aiplatform.Spec.Storage.VectorDB.Size == "" && aiplatform.Spec.Storage.VectorDB.PVCName == "" {
+	if aiplatform.Spec.Profile != aiv1.AIPlatformProfileCPUOnly && aiplatform.Spec.Storage.VectorDB.Size == "" && aiplatform.Spec.Storage.VectorDB.PVCName == "" {
 		aiplatform.Spec.Storage.VectorDB.Size = "50Gi"
 	}
 
@@ -167,6 +167,7 @@ func (v *AIPlatformCustomValidator) ValidateCreate(ctx context.Context, obj runt
 	if errs := v.validateFeatures(aiplatform.Spec.Features, field.NewPath("spec").Child("features")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
+	allErrs = append(allErrs, validateAIPlatformProfile(aiplatform)...)
 
 	// Validate top-level ScaleFactor
 	if errs := v.validateScaleFactor(aiplatform.Spec.ScaleFactor, field.NewPath("spec").Child("scaleFactor")); len(errs) > 0 {
@@ -210,12 +211,47 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldObj, 
 			"objectStorage.region is immutable",
 		))
 	}
+	if oldPlatform.Spec.Profile != aiv1.AIPlatformProfileCPUOnly && aiplatform.Spec.Profile == aiv1.AIPlatformProfileCPUOnly {
+		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec").Child("profile"),
+			"switching an existing model-serving AIPlatform to cpuOnly is not supported"))
+	}
 
 	if len(allErrs) > 0 {
 		return warnings, allErrs.ToAggregate()
 	}
 
 	return warnings, nil
+}
+
+func validateAIPlatformProfile(p *aiv1.AIPlatform) field.ErrorList {
+	path := field.NewPath("spec")
+	if p.Spec.Profile == "" || p.Spec.Profile == aiv1.AIPlatformProfileFull {
+		return nil
+	}
+	if p.Spec.Profile != aiv1.AIPlatformProfileCPUOnly {
+		return field.ErrorList{field.NotSupported(path.Child("profile"), p.Spec.Profile, []string{"full", "cpuOnly"})}
+	}
+	var errs field.ErrorList
+	for i, feature := range p.Spec.Features {
+		if feature.Name == "saia" || feature.Name == "seca" {
+			errs = append(errs, field.Forbidden(path.Child("features").Index(i).Child("name"), "cpuOnly does not support SAIA or SECA"))
+		}
+	}
+	if p.Spec.GpuInstanceType != "" || p.Spec.DefaultAcceleratorType != "" || p.Spec.GPUSchedulingSpec != nil || p.Spec.WorkerGroupConfig != nil ||
+		(p.Spec.ScaleFactor != nil && *p.Spec.ScaleFactor > 1) || p.Spec.Images.RayHeadGroupImage != "" || p.Spec.Images.RayWorkerGroupImage != "" ||
+		p.Spec.Images.WeaviateImage != "" || p.Spec.Images.SAIAImage != "" {
+		errs = append(errs, field.Forbidden(path.Child("profile"), "cpuOnly does not support Ray, Weaviate, SAIA, or GPU settings"))
+	}
+	if p.Spec.Storage.VectorDB.Size != "" || p.Spec.Storage.VectorDB.PVCName != "" || p.Spec.Storage.VectorDB.StorageClassName != "" {
+		errs = append(errs, field.Forbidden(path.Child("storage").Child("vectorDB"), "cpuOnly does not use vectorDB storage"))
+	}
+	if p.Spec.Ingress != nil && p.Spec.Ingress.Enabled {
+		errs = append(errs, field.Forbidden(path.Child("ingress"), "cpuOnly does not support Ray-backed ingress"))
+	}
+	if p.Spec.Sidecars.Envoy || p.Spec.Sidecars.Otel || p.Spec.Sidecars.PrometheusOperator {
+		errs = append(errs, field.Forbidden(path.Child("sidecars"), "cpuOnly does not support sidecars"))
+	}
+	return errs
 }
 
 // ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type AIPlatform.
@@ -590,6 +626,9 @@ func validateLASFeature(las *aiv1.LASFeatureSpec, fldPath *field.Path) field.Err
 		errs = append(errs, field.NotSupported(fldPath.Child("networkMode"), las.NetworkMode, []string{"connected", "airgapped"}))
 	}
 	if las.Tracing != nil && las.Tracing.Enabled {
+		if las.NetworkMode == "airgapped" {
+			errs = append(errs, field.Forbidden(fldPath.Child("tracing", "enabled"), "tracing is not supported in airgapped mode"))
+		}
 		endpoint := strings.TrimSpace(las.Tracing.Endpoint)
 		if endpoint == "" {
 			errs = append(errs, field.Required(fldPath.Child("tracing", "endpoint"), "endpoint must be specified when tracing is enabled"))

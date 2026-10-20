@@ -1,0 +1,36 @@
+# Test-only helper input. Keep a completed copy outside Git.
+# Install on a private dependency host before building the cluster bundle:
+# private AWS preflight requires a real endpoint and application access key.
+# The host can use an encrypted root EBS path after verifying the volume, or
+# change storageMode to mounted-volume for a dedicated encrypted data volume.
+# The community MinIO OCI archive must be built from this exact source commit
+# on a connected Linux x86_64 host. The helper does not fetch source at install.
+host:
+  bindIp: "CHANGE_ME_PRIVATE_IP"
+  dataRoot: /var/lib/las-deps
+  storageMode: encrypted-root-ebs
+  rootEbsEncryptedConfirmed: false # Set true only after verifying this host's encrypted EBS.
+  outputFile: /root/las-deps-connection.json
+images:
+  minio: "sha256:CHANGE_ME_SOURCE_BUILT_IMAGE_ID"
+  postgres: "CHANGE_ME_POSTGRES_REPOSITORY@sha256:CHANGE_ME"
+  redis: "CHANGE_ME_REDIS_REPOSITORY@sha256:CHANGE_ME"
+minio:
+  distribution: community-source
+  sourceCommit: 58659f26f45f2c189f5fd1c7267da60c10024daa
+  localArchive: /absolute/path/to/source-built-minio.oci.tar
+  localArchiveSha256: "CHANGE_ME_SHA256"
+client:
+  mcBinary: /absolute/path/to/prestaged/mc-linux-amd64
+  mcSha256: "CHANGE_ME_SHA256"
+# Omit credentials to generate root-owned, 0600 test credentials on install.
+database:
+  user: las
+  name: las
+objectStore:
+  bucket: ai-platform
+kubernetes:
+  namespace: ai-platform
+  licenseSecretName: las-auth
+  postgresSecretName: las-postgres
+  redisSecretName: las-redis

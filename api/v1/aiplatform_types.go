@@ -42,6 +42,13 @@ type AIPlatform struct {
 
 // AIPlatformSpec defines the desired state
 type AIPlatformSpec struct {
+	// Profile selects the platform infrastructure to reconcile. Omitted or
+	// "full" keeps model serving; "cpuOnly" runs feature services without Ray
+	// or Weaviate.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=full;cpuOnly
+	Profile AIPlatformProfile `json:"profile,omitempty"`
+
 	// ObjectStorage defines the object storage configuration for AI artifacts, tasks, and models
 	// Supported providers: S3, GCS, Azure Blob Storage, MinIO
 	// +kubebuilder:validation:Required
@@ -131,6 +138,13 @@ type AIPlatformSpec struct {
 	ServiceTemplate corev1.Service `json:"serviceTemplate,omitempty"`
 }
 
+type AIPlatformProfile string
+
+const (
+	AIPlatformProfileFull    AIPlatformProfile = "full"
+	AIPlatformProfileCPUOnly AIPlatformProfile = "cpuOnly"
+)
+
 // Images defines custom container images for platform components
 type Images struct {
 	// SAIA service image
@@ -175,8 +189,8 @@ type VectorDBStorageSpec struct {
 	PVCName string `json:"pvcName,omitempty"`
 
 	// Size of the volume to create if PVCName is not provided
+	// The mutating webhook defaults this for full profiles; cpuOnly must keep it unset.
 	// +kubebuilder:validation:Optional
-	// +kubebuilder:default="50Gi"
 	// +kubebuilder:validation:Pattern=`^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$`
 	Size string `json:"size,omitempty"`
 

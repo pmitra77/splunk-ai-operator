@@ -1,6 +1,6 @@
 # Storage Configuration for AIPlatform
 
-This guide explains how to configure persistent storage for the Weaviate vector database so your AI data persists across restarts.
+This guide explains how to configure persistent storage for the Weaviate vector database in the full AIPlatform profile so your AI data persists across restarts. The `cpuOnly` profile does not deploy Weaviate and rejects `storage.vectorDB` settings.
 
 ## Quick Start
 
@@ -254,7 +254,7 @@ volumeBindingMode: WaitForFirstConsumer
 
 ## Default Values
 
-If `storage.vectorDB` is not specified, the following defaults are used:
+For the full profile, if `storage.vectorDB` is not specified, the mutating webhook applies these defaults:
 
 ```yaml
 spec:

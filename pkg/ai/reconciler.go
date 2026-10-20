@@ -63,34 +63,45 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 		latest.Status.VectorDbServiceName = p.Status.VectorDbServiceName
 		_ = r.Status().Update(ctx, latest)
 	}()
-	raybuilder := raybuilder.New(r.p, r.Client, r.Scheme, r.Recorder)
-	sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
 	var scaleResult reconcile.Result
 
-	stages := []struct {
+	type stage struct {
 		name string
 		fn   func(context.Context, *aiApi.AIPlatform) error
-	}{
-		{"Validate", r.validate},
-		//{"ApplicationsConfigMap", raybuilder.ReconcileApplicationsConfigMap},
-		//{"InstancesConfigMap", raybuilder.ReconcileInstancesConfigMap},
-		//{"ServeConfigMap", raybuilder.ReconcileServeConfigMap},
-		{"Sidecars", sidecarBuilder.Reconcile},
-		{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
-		{"RayService", raybuilder.ReconcileRayService},
-		{"ActiveClusterScale", func(ctx context.Context, p *aiApi.AIPlatform) error {
-			var err error
-			scaleResult, err = raybuilder.ReconcileActiveClusterScale(ctx, p)
-			return err
-		}},
-		{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
-		{"Ingress", r.ReconcileIngress},
-		// collect status of each stage
-		{"RayServiceStatus", raybuilder.ApplyNormalizedConditions},
-		{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
-		{"IngressStatus", r.UpdateIngressStatus},
-		{"AIService", r.ReconcileFeatures},
-		{"AIServiceStatus", r.CheckAIServiceStatus},
+	}
+	stages := []stage{{"Validate", r.validate}}
+	if p.Spec.Profile == aiApi.AIPlatformProfileCPUOnly {
+		// The CPU-only profile has no Ray, vector database, or Ray-backed ingress.
+		// Sidecars are also omitted because their platform resources include
+		// Ray-specific Prometheus rules even when all sidecar flags are false.
+		stages = append(stages,
+			stage{"AIService", r.ReconcileFeatures},
+			stage{"AIServiceStatus", r.CheckAIServiceStatus},
+		)
+	} else {
+		raybuilder := raybuilder.New(r.p, r.Client, r.Scheme, r.Recorder)
+		sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
+		stages = append(stages, []stage{
+			//{"ApplicationsConfigMap", raybuilder.ReconcileApplicationsConfigMap},
+			//{"InstancesConfigMap", raybuilder.ReconcileInstancesConfigMap},
+			//{"ServeConfigMap", raybuilder.ReconcileServeConfigMap},
+			{"Sidecars", sidecarBuilder.Reconcile},
+			{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
+			{"RayService", raybuilder.ReconcileRayService},
+			{"ActiveClusterScale", func(ctx context.Context, p *aiApi.AIPlatform) error {
+				var err error
+				scaleResult, err = raybuilder.ReconcileActiveClusterScale(ctx, p)
+				return err
+			}},
+			{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
+			{"Ingress", r.ReconcileIngress},
+			// collect status of each stage
+			{"RayServiceStatus", raybuilder.ApplyNormalizedConditions},
+			{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
+			{"IngressStatus", r.UpdateIngressStatus},
+			{"AIService", r.ReconcileFeatures},
+			{"AIServiceStatus", r.CheckAIServiceStatus},
+		}...)
 	}
 
 	for _, stage := range stages {
@@ -288,7 +299,10 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 	aiPlatformURL := ""
 	replicas := int32(1)
 	serviceAccountName := feature.ServiceAccountName
-	if feature.Name == agentRuntimeFeatureName && serviceAccountName == "" {
+	// SLIM's reconciler uses this generated ServiceAccount. Keep the same
+	// default in the parent desired spec so the two controllers do not
+	// alternately clear and restore the name on every reconcile.
+	if (feature.Name == agentRuntimeFeatureName || feature.Name == "slim") && serviceAccountName == "" {
 		serviceAccountName = name + "-sa"
 	}
 	resources := corev1.ResourceRequirements{}
@@ -349,7 +363,7 @@ func (r *AIPlatformReconciler) buildAIService(ctx context.Context, platform *aiA
 			Port:                80,
 			Resources:           resources,
 			Metrics: aiApi.MetricsConfig{
-				Enabled: true,
+				Enabled: platform.Spec.Profile != aiApi.AIPlatformProfileCPUOnly || feature.Name != "slim",
 				Port:    metricsPort,
 				Path:    "/metrics",
 			},
@@ -422,10 +436,20 @@ func (r *AIPlatformReconciler) CheckAIServiceStatus(ctx context.Context, platfor
 	); err != nil {
 		return fmt.Errorf("failed to list AIService children: %w", err)
 	}
+	// A newly created child may not be visible in the cache immediately. Do not
+	// report a CPU-only platform Ready until every selected feature is observed.
+	var pending map[string]struct{}
+	if platform.Spec.Profile == aiApi.AIPlatformProfileCPUOnly {
+		pending = make(map[string]struct{}, len(platform.Spec.Features))
+		for _, feature := range platform.Spec.Features {
+			pending[featureServiceName(platform.Name, feature)] = struct{}{}
+		}
+	}
 
 	// Check each child's status conditions
 	for i := range children.Items {
 		child := &children.Items[i]
+		delete(pending, child.Name)
 
 		// Check if AIService has any failed conditions
 		for _, cond := range child.Status.Conditions {
@@ -447,6 +471,20 @@ func (r *AIPlatformReconciler) CheckAIServiceStatus(ctx context.Context, platfor
 				}
 				return fmt.Errorf("AIService %s LAS Ready condition is %s for generation %d (observed generation %d, reason %s): %s", child.Name, ready.Status, child.Generation, ready.ObservedGeneration, ready.Reason, ready.Message)
 			}
+		} else if platform.Spec.Profile == aiApi.AIPlatformProfileCPUOnly && child.Spec.Feature.Name == "slim" {
+			// SLIM is part of the CPU-only caller route. Its feature reconciler
+			// writes the resource's observed generation but does not populate
+			// ObservedGeneration on individual conditions.
+			ready := meta.FindStatusCondition(child.Status.Conditions, "Ready")
+			if child.Status.ObservedGeneration < child.Generation || ready == nil || ready.Status != metav1.ConditionTrue {
+				return fmt.Errorf("AIService %s SLIM is not ready for generation %d", child.Name, child.Generation)
+			}
+		}
+	}
+	for _, feature := range platform.Spec.Features {
+		name := featureServiceName(platform.Name, feature)
+		if _, missing := pending[name]; missing {
+			return fmt.Errorf("AIService %s has not been observed for CPU-only platform %s", name, platform.Name)
 		}
 	}
 

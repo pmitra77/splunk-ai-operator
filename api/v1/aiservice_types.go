@@ -45,9 +45,11 @@ type AIServiceSpec struct {
 	// +kubebuilder:validation:Optional
 	SplunkConfiguration SplunkConfigurationSpec `json:"splunkConfiguration,omitempty"`
 
-	// VectorDbUrl specifies the URL or service name for the vector database
-	// +kubebuilder:validation:Required
-	VectorDbUrl string `json:"vectorDbUrl"`
+	// VectorDbUrl specifies the URL or service name for the vector database.
+	// It is required for full-profile services and unused by cpuOnly SLIM and Agent Runtime.
+	// The validating webhook enforces the profile-specific requirement.
+	// +kubebuilder:validation:Optional
+	VectorDbUrl string `json:"vectorDbUrl,omitempty"`
 
 	// AIPlatformUrl specifies the URL for the AI Platform (deprecated, use AIPlatformRef)
 	// +kubebuilder:validation:Optional

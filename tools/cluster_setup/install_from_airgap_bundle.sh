@@ -15,7 +15,7 @@
 set -euo pipefail
 
 BUNDLE_TARBALL=""
-CONFIG_FILE=""
+CONFIG_FILE="${CONFIG_FILE:-}"
 EXTRACT_DIR="${EXTRACT_DIR:-/opt/airgap}"
 INSTALLER_SCRIPT=""
 SUBCOMMAND="${SUBCOMMAND:-install}"
@@ -42,14 +42,16 @@ REQUIRED
 OPTIONS
   --config FILE         Path to your k0s-cluster-config.yaml.
                         If omitted, the installer looks for CONFIG_FILE in the
-                        environment or its default location.
+                        environment or its default location. Required for a
+                        CPU-only bundle.
 
   --extract-dir DIR     Directory where the bundle is extracted.
                         Default: /opt/airgap
                         Env: EXTRACT_DIR
 
   --installer SCRIPT    Path to k0s_cluster_with_stack.sh.
-                        Default: same directory as this script.
+                        Default: same directory as this script. A CPU-only
+                        bundle runs its included version-matched installer.
 
   --subcommand CMD      Installer subcommand to run: install | join-workers
                         Default: install
@@ -79,6 +81,10 @@ WHAT THIS SCRIPT DOES
      AIRGAP_MODE                       → true
 
   7. Invokes k0s_cluster_with_stack.sh <subcommand>.
+
+  CPU-only bundles include the installer and matching operator manifests. The
+  wrapper verifies their contents and the OCI image archive references before
+  installation, then runs from the bundled source directory.
 
 NOTE ON GPU NODE PACKAGES
   The bundle contains OS package files under packages/:
@@ -156,11 +162,6 @@ require_cmd helm
 require_cmd kubectl
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -z "${INSTALLER_SCRIPT}" ]]; then
-  INSTALLER_SCRIPT="${SCRIPT_DIR}/k0s_cluster_with_stack.sh"
-fi
-[[ -f "${INSTALLER_SCRIPT}" ]] || err "Installer not found: ${INSTALLER_SCRIPT}. Pass --installer /path/to/k0s_cluster_with_stack.sh"
-[[ -x "${INSTALLER_SCRIPT}" ]] || chmod +x "${INSTALLER_SCRIPT}"
 
 log "=== Splunk AI Platform — Air-Gap Installation ==="
 log "Bundle          : ${BUNDLE_TARBALL}"
@@ -173,11 +174,15 @@ log ""
 # ── Extract bundle ────────────────────────────────────────────────────────────
 log "Extracting bundle..."
 mkdir -p "${EXTRACT_DIR}"
+EXTRACT_DIR="$(cd "${EXTRACT_DIR}" && pwd)"
+BUNDLE_NAME="$(tar -tzf "${BUNDLE_TARBALL}" | sed -n '1{s@/.*@@;p;}')"
+[[ "${BUNDLE_NAME}" == airgap-bundle-* ]] ||
+  err "Bundle archive does not start with an airgap-bundle directory"
 tar -xzf "${BUNDLE_TARBALL}" -C "${EXTRACT_DIR}"
 
-# Find the extracted bundle directory (named airgap-bundle-<timestamp>)
-BUNDLE_DIR="$(find "${EXTRACT_DIR}" -maxdepth 1 -mindepth 1 -type d -name 'airgap-bundle-*' | sort | tail -1)"
-[[ -n "${BUNDLE_DIR}" ]] || err "Could not find extracted bundle directory in ${EXTRACT_DIR}"
+# Use the directory named by this archive; another bundle may already be here.
+BUNDLE_DIR="${EXTRACT_DIR}/${BUNDLE_NAME}"
+[[ -d "${BUNDLE_DIR}" ]] || err "Could not find extracted bundle directory in ${EXTRACT_DIR}"
 log "Bundle extracted to: ${BUNDLE_DIR}"
 
 # ── Verify checksums ──────────────────────────────────────────────────────────
@@ -193,7 +198,7 @@ if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; th
   ) || err "Checksum verification failed — bundle may be corrupt or tampered with."
   log "Checksums verified OK"
 else
-  warn "sha256sum / shasum not found — skipping checksum verification"
+  err "sha256sum or shasum is required to verify the offline bundle"
 fi
 
 # ── Read version manifest ─────────────────────────────────────────────────────
@@ -216,6 +221,144 @@ log "  kuberay     : ${KUBERAY_CHART_VERSION}"
 log "  metallb     : ${METALLB_CHART_VERSION}"
 log "  prometheus  : ${PROMETHEUS_CHART_VERSION}"
 log "  otel        : ${OTEL_CHART_VERSION}"
+
+# Check the selected workload closure before modifying the installer host or
+# reaching any cluster node. A bundle prepared for another config must fail
+# here, rather than leaving a partially installed private cluster.
+CPU_ONLY_BUNDLE=false
+if [[ -f "${BUNDLE_DIR}/bundle-profile.txt" ]]; then
+  [[ "$(cat "${BUNDLE_DIR}/bundle-profile.txt")" == "cpuOnly" ]] ||
+    err "Unknown bundle profile"
+  CPU_ONLY_BUNDLE=true
+  [[ -n "${CONFIG_FILE}" ]] ||
+    err "CPU-only bundle requires an explicit --config or CONFIG_FILE"
+fi
+if [[ -n "${CONFIG_FILE}" ]]; then
+  [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
+  BUNDLE_YQ="${BUNDLE_DIR}/binaries/yq"
+  [[ -x "${BUNDLE_YQ}" ]] || err "Bundled yq is missing or not executable"
+  if [[ "$("${BUNDLE_YQ}" eval -r '.aiPlatform.profile // ""' "${CONFIG_FILE}")" == "cpuOnly" ]]; then
+    [[ "${CPU_ONLY_BUNDLE}" == "true" ]] ||
+      err "CPU-only config requires a CPU-only bundle made with --config"
+    [[ "$("${BUNDLE_YQ}" eval -r '.cluster.airgap // false' "${CONFIG_FILE}")" == "true" ]] || \
+      err "cpuOnly offline bundle requires cluster.airgap: true"
+    for required in k0s-images.tar k0s-images.list addon-images.tar addon-images.list workload-images.tar workload-images.list; do
+      [[ -s "${BUNDLE_DIR}/images/${required}" ]] || err "Required CPU-only bundle artifact missing: images/${required}"
+    done
+    for expression in \
+      '.images.operator.image' \
+      '.images.splunk.image' \
+      '.images.splunk.operatorImage' \
+      '.images.slim.apiImage'; do
+      expected="$("${BUNDLE_YQ}" eval -r "${expression} // \"\"" "${CONFIG_FILE}")"
+      [[ -n "${expected}" && "${expected}" != "null" ]] || err "Missing ${expression} in CPU-only config"
+      grep -Fxq -- "${expected}" "${BUNDLE_DIR}/images/workload-images.list" || \
+        err "CPU-only bundle does not contain configured image ${expression}: ${expected}"
+    done
+    las_repository="$("${BUNDLE_YQ}" eval -r '.aiPlatform.features[] | select(.name == "agentruntime") | .las.image.repository' "${CONFIG_FILE}")"
+    las_tag="$("${BUNDLE_YQ}" eval -r '.aiPlatform.features[] | select(.name == "agentruntime") | .las.image.tag' "${CONFIG_FILE}")"
+    [[ -n "${las_repository}" && -n "${las_tag}" && "${las_repository}" != "null" && "${las_tag}" != "null" ]] || \
+      err "Missing Agent Runtime image repository/tag in CPU-only config"
+    grep -Fxq -- "${las_repository}:${las_tag}" "${BUNDLE_DIR}/images/workload-images.list" || \
+      err "CPU-only bundle does not contain configured Agent Runtime image"
+    log "CPU-only workload image closure verified against ${CONFIG_FILE}"
+  elif [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+    err "CPU-only bundle requires aiPlatform.profile: cpuOnly"
+  fi
+fi
+
+if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+  require_cmd cmp
+  for required in binaries/k0s binaries/yq manifests/cert-manager.yaml \
+                  manifests/local-path-storage.yaml packages/pyyaml.filename; do
+    [[ -s "${BUNDLE_DIR}/${required}" ]] ||
+      err "Required CPU-only bundle artifact missing: ${required}"
+  done
+  bundled_pyyaml="$(cat "${BUNDLE_DIR}/packages/pyyaml.filename")"
+  [[ "${bundled_pyyaml}" == "$(basename "${bundled_pyyaml}")" &&
+     -s "${BUNDLE_DIR}/packages/${bundled_pyyaml}" ]] ||
+    err "Bundled PyYAML package is missing or has an invalid filename"
+  BUNDLED_SETUP="${BUNDLE_DIR}/cluster_setup"
+  for required in k0s_cluster_with_stack.sh install_from_airgap_bundle.sh \
+                  artifacts.yaml splunk-operator-cluster.yaml las_deployment.py; do
+    [[ -s "${BUNDLED_SETUP}/${required}" ]] ||
+      err "Version-matched installer artifact missing: cluster_setup/${required}"
+  done
+  cmp -s "${SCRIPT_DIR}/install_from_airgap_bundle.sh" \
+         "${BUNDLED_SETUP}/install_from_airgap_bundle.sh" ||
+    err "Bundle was built from a different installer revision; run its bundled installer"
+  if [[ -n "${INSTALLER_SCRIPT}" ]]; then
+    cmp -s "${INSTALLER_SCRIPT}" "${BUNDLED_SETUP}/k0s_cluster_with_stack.sh" ||
+      err "--installer differs from the version-matched installer in the bundle"
+  fi
+  INSTALLER_SCRIPT="${BUNDLED_SETUP}/k0s_cluster_with_stack.sh"
+
+  # The config's relative files are resolved from the bundled script directory
+  # when we invoke it below. Absolute files are permitted only if identical.
+  for entry in 'aiPlatform:artifacts.yaml' 'splunkOperator:splunk-operator-cluster.yaml'; do
+    key="${entry%%:*}"
+    file="${entry#*:}"
+    configured="$("${BUNDLE_YQ}" eval -r ".files.${key} // \"\"" "${CONFIG_FILE}")"
+    [[ -n "${configured}" ]] || err "Missing files.${key} in CPU-only config"
+    if [[ "${configured}" == /* ]]; then
+      candidate="${configured}"
+    else
+      candidate="${BUNDLED_SETUP}/${configured}"
+    fi
+    [[ -f "${candidate}" ]] && cmp -s "${candidate}" "${BUNDLED_SETUP}/${file}" ||
+      err "files.${key} must match the bundled ${file}"
+  done
+
+  # The CPU profile has no Helm add-ons. Its two static manifests must account
+  # for exactly the add-on references that were packed into the OCI archive.
+  manifest_refs="$(grep -hoE 'image:[[:space:]]*["'"'"']?[^"'"'"' ]+' \
+      "${BUNDLE_DIR}/manifests/cert-manager.yaml" \
+      "${BUNDLE_DIR}/manifests/local-path-storage.yaml" \
+      | sed -E 's/image:[[:space:]]*["'"'"']?//' \
+      | grep -E '[:/]' | sort -u)" ||
+    err "Could not enumerate CPU-only manifest images"
+  [[ -n "${manifest_refs}" && "${manifest_refs}" == "$(cat "${BUNDLE_DIR}/images/addon-images.list")" ]] ||
+    err "CPU-only add-on image list does not match its manifests"
+  for archive in "${BUNDLE_DIR}"/images/*.tar; do
+    case "$(basename "${archive}")" in
+      k0s-images.tar|addon-images.tar|workload-images.tar) ;;
+      *) err "Unexpected image archive in CPU-only bundle: ${archive}" ;;
+    esac
+  done
+
+  # k0s emits OCI Image Layout archives. Verify actual named references in
+  # all three archives, then compare the workload list with the chosen config.
+  for kind in k0s addon workload; do
+    archive="${BUNDLE_DIR}/images/${kind}-images.tar"
+    list="${BUNDLE_DIR}/images/${kind}-images.list"
+    index="$(tar -xOf "${archive}" index.json 2>/dev/null)" ||
+      index="$(tar -xOf "${archive}" ./index.json 2>/dev/null)" ||
+      err "OCI index.json missing from images/${kind}-images.tar"
+    refs="$(printf '%s' "${index}" |
+      "${BUNDLE_YQ}" eval -r '.manifests[] | .annotations."org.opencontainers.image.ref.name" // .annotations."io.containerd.image.name" // ""' -)" ||
+      err "Cannot read OCI references in images/${kind}-images.tar"
+    while IFS= read -r image_ref; do
+      [[ -z "${image_ref}" ]] && continue
+      canonical="${image_ref}"
+      first="${image_ref%%/*}"
+      if [[ "${image_ref}" != */* ]]; then
+        canonical="docker.io/library/${image_ref}"
+      elif [[ "${first}" != *.* && "${first}" != *:* && "${first}" != "localhost" ]]; then
+        canonical="docker.io/${image_ref}"
+      fi
+      grep -Fxq -- "${image_ref}" <<< "${refs}" ||
+        grep -Fxq -- "${canonical}" <<< "${refs}" ||
+        err "OCI archive images/${kind}-images.tar is missing image ${image_ref}"
+    done < "${list}"
+  done
+  log "CPU-only OCI archive and version-matched installer closure verified"
+else
+  [[ -n "${INSTALLER_SCRIPT}" ]] ||
+    INSTALLER_SCRIPT="${SCRIPT_DIR}/k0s_cluster_with_stack.sh"
+fi
+[[ -f "${INSTALLER_SCRIPT}" ]] ||
+  err "Installer not found: ${INSTALLER_SCRIPT}"
+[[ -x "${INSTALLER_SCRIPT}" ]] || chmod +x "${INSTALLER_SCRIPT}"
 
 # ── Install bundled k0s binary into PATH for node provisioning ────────────────
 log "Installing bundled k0s binary to /usr/local/bin/k0s ..."
@@ -282,13 +425,15 @@ if compgen -G "${BUNDLE_DIR}/images/*.tar" >/dev/null 2>&1; then
   log "Pre-loaded image bundles found in: ${AIRGAP_K0S_IMAGE_DIR}"
   for _t in "${BUNDLE_DIR}/images"/*.tar; do log "  - $(basename "${_t}") ($(du -h "${_t}" | cut -f1))"; done
 else
-  warn "No pre-loaded image bundles in air-gap bundle (images/*.tar) — k0s control-plane AND add-on images may fail to pull on air-gapped nodes."
+  err "No pre-loaded image bundles in air-gap bundle (images/*.tar)"
 fi
 
 # Static manifests
 export CERT_MANAGER_MANIFEST_URL="file://${BUNDLE_DIR}/manifests/cert-manager.yaml"
 export LOCAL_PATH_MANIFEST_URL="file://${BUNDLE_DIR}/manifests/local-path-storage.yaml"
-export NVIDIA_DEVICE_PLUGIN_MANIFEST_URL="file://${BUNDLE_DIR}/manifests/nvidia-device-plugin.yml"
+if [[ "${CPU_ONLY_BUNDLE}" != "true" ]]; then
+  export NVIDIA_DEVICE_PLUGIN_MANIFEST_URL="file://${BUNDLE_DIR}/manifests/nvidia-device-plugin.yml"
+fi
 
 # Helm chart paths — installer uses these instead of remote repos.
 # helm pull sometimes produces underscores instead of dashes in the filename,
@@ -303,15 +448,17 @@ _resolve_chart() {
   echo "${matches[0]}"
 }
 
-PROM_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/kube-prometheus-stack-${PROMETHEUS_CHART_VERSION}*.tgz" "kube-prometheus-stack")"
-OTEL_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/opentelemetry-operator-${OTEL_CHART_VERSION}*.tgz" "opentelemetry-operator")"
-KUBERAY_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/kuberay-operator-${KUBERAY_CHART_VERSION}*.tgz" "kuberay-operator")"
-METALLB_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/metallb-${METALLB_CHART_VERSION}*.tgz" "metallb")"
+if [[ "${CPU_ONLY_BUNDLE}" != "true" ]]; then
+  PROM_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/kube-prometheus-stack-${PROMETHEUS_CHART_VERSION}*.tgz" "kube-prometheus-stack")"
+  OTEL_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/opentelemetry-operator-${OTEL_CHART_VERSION}*.tgz" "opentelemetry-operator")"
+  KUBERAY_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/kuberay-operator-${KUBERAY_CHART_VERSION}*.tgz" "kuberay-operator")"
+  METALLB_TGZ="$(_resolve_chart "${LOCAL_CHARTS_DIR}/metallb-${METALLB_CHART_VERSION}*.tgz" "metallb")"
 
-export PROMETHEUS_CHART_PATH="${PROM_TGZ}"
-export OTEL_CHART_PATH="${OTEL_TGZ}"
-export KUBERAY_CHART_PATH="${KUBERAY_TGZ}"
-export METALLB_CHART_PATH="${METALLB_TGZ}"
+  export PROMETHEUS_CHART_PATH="${PROM_TGZ}"
+  export OTEL_CHART_PATH="${OTEL_TGZ}"
+  export KUBERAY_CHART_PATH="${KUBERAY_TGZ}"
+  export METALLB_CHART_PATH="${METALLB_TGZ}"
+fi
 
 # GPU node OS packages — pyyaml wheel path for offline pip3 install on all nodes
 PYYAML_FNAME=""
@@ -332,12 +479,14 @@ log "Environment overrides set. Launching installer..."
 log ""
 
 # ── Invoke main installer ─────────────────────────────────────────────────────
-INSTALLER_CMD="${INSTALLER_SCRIPT} ${SUBCOMMAND}"
 if [[ -n "${CONFIG_FILE}" ]]; then
   CONFIG_FILE="$(realpath "${CONFIG_FILE}")"
-  exec env CONFIG_FILE="${CONFIG_FILE}" ${INSTALLER_CMD}
+  if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
+    cd "${BUNDLED_SETUP}"
+  fi
+  exec env CONFIG_FILE="${CONFIG_FILE}" "${INSTALLER_SCRIPT}" "${SUBCOMMAND}"
 else
   log "No --config supplied. The installer will look for CONFIG_FILE in the environment"
   log "or its default location. Set CONFIG_FILE if it is not in the current directory."
-  exec ${INSTALLER_CMD}
+  exec "${INSTALLER_SCRIPT}" "${SUBCOMMAND}"
 fi

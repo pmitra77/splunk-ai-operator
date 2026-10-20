@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -67,6 +68,7 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 		{"SlimService", r.reconcileSlimService},
 		{"SlimMetricsService", r.reconcileSlimMetricsService},
 		{"ServiceMonitor", r.reconcileServiceMonitor},
+		{"SlimDeploymentAvailable", r.checkSlimDeploymentAvailable},
 	}
 
 	for _, stage := range stages {
@@ -201,29 +203,29 @@ func slimPlatformURL(raw string) string {
 }
 
 func (r *SlimReconciler) reconcileServiceAccount(ctx context.Context, ai *aiv1.AIService) error {
+	defaultName := ai.Name + "-sa"
 	if ai.Spec.ServiceAccountName == "" {
 		cleanServiceTemplate(&ai.Spec.ServiceTemplate)
 
-		ai.Spec.ServiceAccountName = ai.Name + "-sa"
+		ai.Spec.ServiceAccountName = defaultName
 		if err := r.Update(ctx, ai); err != nil {
 			return fmt.Errorf("updating SA name in spec: %w", err)
 		}
-		sa := &corev1.ServiceAccount{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      ai.Spec.ServiceAccountName,
-				Namespace: ai.Namespace,
-			},
-		}
-		if err := controllerutil.SetControllerReference(ai, sa, r.Scheme); err != nil {
-			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "ownerref on SA failed")
-			return fmt.Errorf("ownerref on SA: %w", err)
-		}
-		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sa, func() error {
-			return nil
-		}); err != nil {
-			r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update SA failed")
-			return fmt.Errorf("create/update SA: %w", err)
-		}
+	}
+	// A custom name refers to a caller-managed account. For the generated name,
+	// ensure the account exists even when the parent supplied the default in
+	// the initial AIService spec.
+	if ai.Spec.ServiceAccountName != defaultName {
+		return nil
+	}
+	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name: defaultName, Namespace: ai.Namespace,
+	}}
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sa, func() error {
+		return controllerutil.SetControllerReference(ai, sa, r.Scheme)
+	}); err != nil {
+		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update SA failed")
+		return fmt.Errorf("create/update SA: %w", err)
 	}
 	return nil
 }
@@ -485,14 +487,15 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{Name: featureConfigName},
+					DefaultMode:          slimInt32(420),
 				},
 			},
 		},
 	}
 
 	ports := []corev1.ContainerPort{
-		{Name: "http", ContainerPort: 8080},
-		{Name: "metrics", ContainerPort: 8088},
+		{Name: "http", ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
+		{Name: "metrics", ContainerPort: 8088, Protocol: corev1.ProtocolTCP},
 	}
 	mounts := []corev1.VolumeMount{
 		{Name: "config-volume", MountPath: "/etc/config"},
@@ -533,7 +536,7 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 			corev1.EnvVar{Name: "TLS_CERT_FILE", Value: "/etc/tls/tls.crt"},
 			corev1.EnvVar{Name: "TLS_KEY_FILE", Value: "/etc/tls/tls.key"},
 		)
-		ports = append(ports, corev1.ContainerPort{Name: "https", ContainerPort: 8443})
+		ports = append(ports, corev1.ContainerPort{Name: "https", ContainerPort: 8443, Protocol: corev1.ProtocolTCP})
 	} else {
 		env = append(env, corev1.EnvVar{Name: "TLS_DISABLED", Value: "true"})
 	}
@@ -599,31 +602,70 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 		EnvFrom:         envFrom,
 		LivenessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
-				HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080)},
+				HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080), Scheme: corev1.URISchemeHTTP},
 			},
 			PeriodSeconds:    30,
 			FailureThreshold: 10,
+			TimeoutSeconds:   1,
+			SuccessThreshold: 1,
 		},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
-				HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080)},
+				HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080), Scheme: corev1.URISchemeHTTP},
 			},
 			PeriodSeconds:    30,
 			FailureThreshold: 10,
+			TimeoutSeconds:   1,
+			SuccessThreshold: 1,
 		},
 		StartupProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
-				HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080)},
+				HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: intstr.FromInt(8080), Scheme: corev1.URISchemeHTTP},
 			},
 			InitialDelaySeconds: 30,
 			PeriodSeconds:       30,
 			FailureThreshold:    10,
+			TimeoutSeconds:      1,
+			SuccessThreshold:    1,
 		},
+		TerminationMessagePath:   "/dev/termination-log",
+		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 	}}
+
+	desiredTemplate := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:      map[string]string{"app": ai.Name, "component": ai.Name},
+			Annotations: annotations,
+		},
+		Spec: corev1.PodSpec{
+			ServiceAccountName:            ai.Spec.ServiceAccountName,
+			Containers:                    containers,
+			Volumes:                       volumes,
+			Tolerations:                   ai.Spec.Tolerations,
+			ImagePullSecrets:              ai.Spec.ImagePullSecrets,
+			RestartPolicy:                 corev1.RestartPolicyAlways,
+			DNSPolicy:                     corev1.DNSClusterFirst,
+			SchedulerName:                 "default-scheduler",
+			TerminationGracePeriodSeconds: slimInt64(30),
+			EnableServiceLinks:            slimBool(true),
+		},
+	}
+	if !reflect.DeepEqual(ai.Spec.Affinity, corev1.Affinity{}) {
+		desiredTemplate.Spec.Affinity = ai.Spec.Affinity.DeepCopy()
+	}
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.ObjectMeta.Labels = labels
-		deployment.ObjectMeta.Annotations = annotations
+		// The Deployment controller writes its revision here. Clearing it on
+		// every reconcile causes another update and can keep generation moving.
+		revision := deployment.Annotations["deployment.kubernetes.io/revision"]
+		deployment.ObjectMeta.Annotations = make(map[string]string, len(annotations)+1)
+		for key, value := range annotations {
+			deployment.ObjectMeta.Annotations[key] = value
+		}
+		if revision != "" {
+			deployment.ObjectMeta.Annotations["deployment.kubernetes.io/revision"] = revision
+		}
 		deployment.Spec.Replicas = &ai.Spec.Replicas
 
 		if deployment.Spec.Selector == nil {
@@ -632,24 +674,69 @@ func (r *SlimReconciler) reconcileSlimDeployment(ctx context.Context, ai *aiv1.A
 			}
 		}
 
-		deployment.Spec.Template = corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels:      map[string]string{"app": ai.Name, "component": ai.Name},
-				Annotations: annotations,
-			},
-			Spec: corev1.PodSpec{
-				ServiceAccountName: ai.Spec.ServiceAccountName,
-				Containers:         containers,
-				Volumes:            volumes,
-				Affinity:           &ai.Spec.Affinity,
-				Tolerations:        ai.Spec.Tolerations,
-				ImagePullSecrets:   ai.Spec.ImagePullSecrets,
-			},
+		// Kubernetes fills omitted Pod and container defaults in the stored
+		// template. Replacing it unconditionally drops those defaults and
+		// triggers a fresh rollout even when our managed fields are unchanged.
+		if !slimTemplateMatches(deployment.Spec.Template, desiredTemplate) {
+			deployment.Spec.Template = desiredTemplate
 		}
 		return nil
 	}); err != nil {
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "create/update Deployment failed")
 		return fmt.Errorf("create/update Deployment: %w", err)
+	}
+	return nil
+}
+
+func slimTemplateMatches(actual, desired corev1.PodTemplateSpec) bool {
+	if !reflect.DeepEqual(actual.Labels, desired.Labels) ||
+		!reflect.DeepEqual(actual.Annotations, desired.Annotations) ||
+		len(actual.Spec.Containers) != len(desired.Spec.Containers) ||
+		len(actual.Spec.Volumes) != len(desired.Spec.Volumes) ||
+		len(actual.Spec.Tolerations) != len(desired.Spec.Tolerations) ||
+		len(actual.Spec.ImagePullSecrets) != len(desired.Spec.ImagePullSecrets) {
+		return false
+	}
+	for i := range desired.Spec.Containers {
+		got, want := actual.Spec.Containers[i], desired.Spec.Containers[i]
+		if len(got.Env) != len(want.Env) || len(got.EnvFrom) != len(want.EnvFrom) ||
+			len(got.Ports) != len(want.Ports) || len(got.VolumeMounts) != len(want.VolumeMounts) ||
+			!apiequality.Semantic.DeepEqual(got.Resources, want.Resources) {
+			return false
+		}
+	}
+	if desired.Spec.Affinity == nil && actual.Spec.Affinity != nil &&
+		!reflect.DeepEqual(*actual.Spec.Affinity, corev1.Affinity{}) {
+		return false
+	}
+	return apiequality.Semantic.DeepDerivative(desired.Spec, actual.Spec)
+}
+
+func slimInt32(value int32) *int32 { return &value }
+func slimInt64(value int64) *int64 { return &value }
+func slimBool(value bool) *bool    { return &value }
+
+func (r *SlimReconciler) checkSlimDeploymentAvailable(ctx context.Context, ai *aiv1.AIService) error {
+	platform, err := r.getAIPlatform(ctx, ai.Spec.AIPlatformRef)
+	if err != nil {
+		return fmt.Errorf("fetching AIPlatform for SLIM readiness: %w", err)
+	}
+	if platform.Spec.Profile != aiv1.AIPlatformProfileCPUOnly {
+		return nil
+	}
+	name := ai.Name + "-slim-deployment"
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ai.Namespace}, deployment); err != nil {
+		return fmt.Errorf("observe SLIM Deployment %s: %w", name, err)
+	}
+	desired := ai.Spec.Replicas
+	if deployment.Status.ObservedGeneration < deployment.Generation ||
+		deployment.Status.UpdatedReplicas < desired ||
+		deployment.Status.ReadyReplicas < desired ||
+		deployment.Status.AvailableReplicas < desired {
+		return fmt.Errorf("SLIM Deployment %s is not available for generation %d: %d/%d updated, %d/%d ready, %d/%d available",
+			name, deployment.Generation, deployment.Status.UpdatedReplicas, desired,
+			deployment.Status.ReadyReplicas, desired, deployment.Status.AvailableReplicas, desired)
 	}
 	return nil
 }

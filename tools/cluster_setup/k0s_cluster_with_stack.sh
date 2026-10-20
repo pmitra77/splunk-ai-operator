@@ -111,6 +111,31 @@ config_bool() {
   [[ "${value}" == "true" ]] && echo "true" || echo "false"
 }
 
+# The offline bundle forces air-gapped mode. Otherwise the deployment file
+# selects the mode; a false environment override cannot make it connected.
+resolve_airgap_mode() {
+  local config_file="$1" override="${2:-}" configured configured_type
+  configured_type=$(yq eval '.cluster.airgap | tag' "${config_file}") || return 1
+  case "${configured_type}" in
+    '!!bool'|'!!null') ;;
+    *) echo "cluster.airgap must be a YAML boolean" >&2; return 1 ;;
+  esac
+  configured=$(yq eval '.cluster.airgap // "false"' "${config_file}") || return 1
+  case "${configured}" in
+    true|false) ;;
+    *) echo "cluster.airgap must be true or false" >&2; return 1 ;;
+  esac
+  case "${override}" in
+    ""|true|false) ;;
+    *) echo "AIRGAP_MODE must be true or false" >&2; return 1 ;;
+  esac
+  if [[ "${override}" == "true" || "${configured}" == "true" ]]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
 k0s_feature_enabled() {
   local feature="$1" names
   names=$(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -370,13 +395,13 @@ _check_node_os() {
 # In Full (interactive) mode: always prompts; answer overrides storage.modelStaging.enabled.
 # In Silent mode: honours the config value with no prompt.
 resolve_model_staging() {
-  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
-    log "Silent install: using storage.modelStaging.enabled=${MODEL_STAGING_ENABLED} from config (no prompt)."
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    [[ "${MODEL_STAGING_ENABLED}" == "false" ]] || err "storage.modelStaging.enabled must be false in air-gap mode"
+    log "Air-gap mode: model staging skipped; models must already exist in the private object store."
     return 0
   fi
-  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
-    log "Air-gap mode: model staging skipped (models must be pre-staged in object store); no prompt."
-    MODEL_STAGING_ENABLED=false
+  if [[ "${SILENT_INSTALL:-false}" == "true" ]]; then
+    log "Silent install: using storage.modelStaging.enabled=${MODEL_STAGING_ENABLED} from config (no prompt)."
     return 0
   fi
   # Full/interactive: prompt always overrides config value
@@ -403,6 +428,10 @@ readonly SUPPORTED_ACCELERATORS=("L40S" "H100" "RTX_PRO_6000_BLACKWELL")
 # Prompts when defaultAcceleratorType is missing OR set to an unsupported value,
 # since the CR always requires this field and stage_model_artifacts needs a valid type.
 resolve_accelerator_type() {
+  if [[ "${AI_PLATFORM_PROFILE:-}" == "cpuOnly" ]]; then
+    DEFAULT_ACCELERATOR=""
+    return 0
+  fi
   # Return early only if already set to a valid supported type (case-insensitive).
   # Normalize to the canonical casing from SUPPORTED_ACCELERATORS so the CR value
   # matches the Ray builder's instanceMap keys exactly (e.g. L40S, H100).
@@ -535,6 +564,13 @@ show_install_plan() {
 
 ensure_yq() {
   command -v yq >/dev/null 2>&1 && return 0
+  # The offline bundle stages yq. Never try the connected auto-download when
+  # the wrapper or deployment file selects an air-gapped installation.
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]] || \
+     { [[ -f "${CONFIG_FILE:-}" ]] && grep -Eq '^[[:space:]]+airgap:[[:space:]]*true([[:space:]]*(#.*)?)?$' "${CONFIG_FILE}"; }; then
+    echo "yq must be staged before an air-gapped installation" >&2
+    return 1
+  fi
   local os arch url
   # Pinned version — matches download_from_huggingface.sh; update both together.
   local YQ_VERSION="v4.44.1"
@@ -619,26 +655,19 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
     err "cluster.apiExternalAddress must be an IP address or hostname without a URL scheme"
   fi
 
-  # Air-gap mode: read from YAML (cluster.airgap: true) and allow env var override.
-  # install_from_airgap_bundle.sh sets AIRGAP_MODE=true automatically; customers
-  # running the installer directly should set cluster.airgap: true in their config.
-  local _yaml_airgap
-  _yaml_airgap=$(yq eval '.cluster.airgap // "false"' "${CONFIG_FILE}" 2>/dev/null || echo "false")
-  [[ "${_yaml_airgap}" == "null" ]] && _yaml_airgap="false"
-  # Env var takes precedence over YAML (allows override without editing the file).
-  if [[ "${AIRGAP_MODE:-}" == "true" ]]; then
-    : # already set — env var wins
-  elif [[ "${_yaml_airgap}" == "true" ]]; then
-    export AIRGAP_MODE="true"
-  else
-    export AIRGAP_MODE="false"
+  # install_from_airgap_bundle.sh sets AIRGAP_MODE=true automatically.
+  local resolved_airgap
+  if ! resolved_airgap=$(resolve_airgap_mode "${CONFIG_FILE}" "${AIRGAP_MODE:-}"); then
+    err "Invalid cluster.airgap or AIRGAP_MODE configuration"
   fi
+  export AIRGAP_MODE="${resolved_airgap}"
 
   # Node IPs (for existing infrastructure)
   EXISTING_CONTROLLER_IPS=$(yq eval '.nodes.existingIPs.controllers[]' "${CONFIG_FILE}" 2>/dev/null | tr '\n' ' ' || echo "")
   EXISTING_WORKER_IPS=$(yq eval '.nodes.existingIPs.workers[]' "${CONFIG_FILE}" 2>/dev/null | tr '\n' ' ' || echo "")
   SSH_USER=$(yq eval '.cluster.sshUser' "${CONFIG_FILE}" 2>/dev/null || echo "root")
   SSH_KEY_PATH=$(yq eval '.cluster.sshKeyPath' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  SSH_KNOWN_HOSTS_FILE=$(yq eval '.cluster.sshKnownHostsFile // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
   # Validate existingIPs are provided (mandatory for on-prem)
   if [[ -z "${EXISTING_CONTROLLER_IPS}" ]]; then
@@ -770,6 +799,8 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   RAY_RUNTIME_VERSION="$(yq eval '.operators.ray.rayVersion // "2.44.0"' "$CONFIG_FILE" 2>/dev/null || echo "2.44.0")"
 
   # AI Platform CR configuration
+  AI_PLATFORM_PROFILE=$(yq eval '.aiPlatform.profile // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
+  [[ -z "${AI_PLATFORM_PROFILE}" || "${AI_PLATFORM_PROFILE}" == "full" || "${AI_PLATFORM_PROFILE}" == "cpuOnly" ]] || err "aiPlatform.profile must be full or cpuOnly"
   DEFAULT_ACCELERATOR=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
   WORKER_IMAGE_REGISTRY=$(yq eval '.aiPlatform.workerGroupConfig.imageRegistry // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
@@ -781,7 +812,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
   ECR_REGION=$(yq eval '.ecr.region // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")
 
   # Auto-detect ECR account from AWS if not specified
-  if [[ -z "${ECR_ACCOUNT}" ]] && aws sts get-caller-identity &>/dev/null; then
+  if [[ -z "${ECR_ACCOUNT}" && "${AIRGAP_MODE}" != "true" ]] && aws sts get-caller-identity &>/dev/null; then
     ECR_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
   fi
 
@@ -865,6 +896,104 @@ validate_scale_factor_config() {
   return 0
 }
 
+# The air-gapped CPU test profile must not silently fall back to the legacy
+# GPU stack, a public image, model download, or LangSmith configuration.
+airgap_cpu_profile_selected() {
+  [[ "${AI_PLATFORM_PROFILE:-}" == "cpuOnly" && "${AIRGAP_MODE:-false}" == "true" ]]
+}
+
+validate_airgap_cpu_profile() {
+  airgap_cpu_profile_selected || return 0
+  [[ "${GPU_WORKER_COUNT}" == "0" ]] || err "cpuOnly air-gap profile requires nodes.gpuWorkers: 0"
+  [[ "${MODEL_STAGING_ENABLED}" == "false" ]] || err "cpuOnly air-gap profile requires storage.modelStaging.enabled: false"
+  [[ "${SPLUNK_MODE}" == "internal" ]] || err "cpuOnly air-gap profile requires in-cluster Splunk"
+  local component
+  for component in COMPONENT_CERT_MANAGER COMPONENT_SPLUNK_OPERATOR COMPONENT_SPLUNK_STANDALONE COMPONENT_AI_OPERATOR COMPONENT_AI_PLATFORM_CR; do
+    [[ "${!component}" == "true" ]] || err "cpuOnly air-gap profile requires ${component}=true"
+  done
+  for component in COMPONENT_MONITORING COMPONENT_OTEL COMPONENT_KUBERAY COMPONENT_NVIDIA COMPONENT_METALLB AI_SIDECAR_ENVOY AI_SIDECAR_OTEL AI_SIDECAR_PROMETHEUS; do
+    [[ "${!component}" == "false" ]] || err "cpuOnly air-gap profile requires ${component}=false"
+  done
+  k0s_slim_feature_enabled || err "cpuOnly air-gap profile requires the slim feature"
+  k0s_agentruntime_feature_enabled || err "cpuOnly air-gap profile requires the agentruntime feature"
+  local feature_names feature_name slim_count=0 las_count=0
+  feature_names="$(yq eval '.aiPlatform.features[].name // ""' "${CONFIG_FILE}")"
+  while IFS= read -r feature_name; do
+    case "${feature_name}" in
+      slim) slim_count=$((slim_count + 1)) ;;
+      agentruntime) las_count=$((las_count + 1)) ;;
+      *) err "cpuOnly air-gap profile allows only slim and agentruntime features" ;;
+    esac
+  done <<< "${feature_names}"
+  [[ "${slim_count}" == "1" && "${las_count}" == "1" ]] || err "cpuOnly air-gap profile requires exactly one slim and one agentruntime feature"
+  [[ -z "${LANGSMITH_API_KEY:-}${LANGCHAIN_API_KEY:-}" && "${LANGCHAIN_TRACING_V2:-false}" != "true" ]] || err "cpuOnly air-gap profile rejects LangSmith keys and enabled tracing"
+  local tracing_enabled tracing_key tracing_endpoint
+  tracing_enabled="$(yq eval '.aiPlatform.features[] | select(.name == "agentruntime") | .las.tracing.enabled' "${CONFIG_FILE}")"
+  [[ "${tracing_enabled}" == "false" ]] || err "cpuOnly air-gap profile requires agentruntime.las.tracing.enabled: false"
+  tracing_key="$(yq eval '.aiPlatform.features[] | select(.name == "agentruntime") | .las.tracing.apiKeySecretRef // ""' "${CONFIG_FILE}")"
+  [[ -z "${tracing_key}" ]] || err "cpuOnly air-gap profile rejects LangSmith API key Secret references"
+  tracing_endpoint="$(yq eval '.aiPlatform.features[] | select(.name == "agentruntime") | .las.tracing.endpoint // ""' "${CONFIG_FILE}")"
+  [[ -z "${tracing_endpoint}" ]] || err "cpuOnly air-gap profile rejects tracing.endpoint"
+  [[ -n "${OBJ_STORE_ENDPOINT}" && "${OBJ_STORE_ENDPOINT}" != "null" && "${OBJ_STORE_ENDPOINT}" != *CHANGEME* ]] || err "cpuOnly air-gap profile requires a private objectStore.endpoint"
+  [[ -n "${IMAGE_REGISTRY}" && "${IMAGE_REGISTRY}" == *.* && "${IMAGE_REGISTRY}" != */* ]] || err "cpuOnly air-gap profile requires images.registry to be a private registry hostname"
+  case "${IMAGE_REGISTRY}" in docker.io|quay.io|ghcr.io|gcr.io|registry.k8s.io|public.ecr.aws) err "cpuOnly air-gap profile cannot use public images.registry" ;; esac
+  local image_ref image_label
+  for image_label in OPERATOR_IMAGE SPLUNK_IMAGE SPLUNK_OPERATOR_IMAGE SLIM_API_IMAGE; do
+    image_ref="${!image_label}"
+    [[ -n "${image_ref}" && "${image_ref}" != "null" && "${image_ref}" == "${IMAGE_REGISTRY}/"* ]] || err "cpuOnly air-gap profile requires ${image_label} in ${IMAGE_REGISTRY}"
+    [[ "${image_ref##*/}" == *:* || "${image_ref}" == *@sha256:* ]] || err "${image_label} must have an explicit tag or digest"
+    [[ "${image_ref}" != *:latest && "${image_ref}" != *:preview ]] || err "${image_label} must use a pinned image reference"
+  done
+  local las_repo las_tag
+  las_repo="$(yq eval '.aiPlatform.features[] | select(.name == "agentruntime") | .las.image.repository // ""' "${CONFIG_FILE}")"
+  las_tag="$(yq eval '.aiPlatform.features[] | select(.name == "agentruntime") | .las.image.tag // ""' "${CONFIG_FILE}")"
+  [[ "${las_repo}" == "${IMAGE_REGISTRY}/"* && -n "${las_tag}" && "${las_tag}" != "null" && "${las_tag}" != "latest" && "${las_tag}" != "preview" ]] || err "cpuOnly air-gap profile requires a pinned agentruntime LAS image in ${IMAGE_REGISTRY}"
+  local assistant_id
+  assistant_id="$(yq eval '.aiPlatform.features[] | select(.name == "agentruntime") | .las.assistantId // ""' "${CONFIG_FILE}")"
+  [[ -n "${assistant_id}" && "${assistant_id}" != "null" ]] || err "cpuOnly air-gap profile requires LAS assistantId"
+}
+
+validate_airgap_cpu_bundle() {
+  airgap_cpu_profile_selected || return 0
+  local name path
+  for name in K0S_INSTALL_URL CERT_MANAGER_MANIFEST_URL LOCAL_PATH_MANIFEST_URL; do
+    path="${!name:-}"
+    [[ "${path}" == file://* && -f "${path#file://}" ]] || err "cpuOnly air-gap profile requires a staged local ${name}"
+  done
+  [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" ]] || err "cpuOnly air-gap profile requires a staged image bundle directory"
+  local kind archive list index refs canonical first
+  for kind in k0s addon workload; do
+    archive="${AIRGAP_K0S_IMAGE_DIR}/${kind}-images.tar"
+    list="${AIRGAP_K0S_IMAGE_DIR}/${kind}-images.list"
+    [[ -s "${archive}" && -s "${list}" ]] || err "cpuOnly air-gap profile requires staged ${kind} images and image list"
+    index="$(tar -xOf "${archive}" index.json 2>/dev/null)" || \
+      index="$(tar -xOf "${archive}" ./index.json 2>/dev/null)" || \
+      err "OCI index.json missing from ${archive}"
+    refs="$(printf '%s' "${index}" | yq eval -r '.manifests[] | .annotations."org.opencontainers.image.ref.name" // .annotations."io.containerd.image.name" // ""' -)" || \
+      err "Cannot read OCI image references from ${archive}"
+    while IFS= read -r image_ref; do
+      [[ -z "${image_ref}" ]] && continue
+      canonical="${image_ref}"
+      first="${image_ref%%/*}"
+      if [[ "${image_ref}" != */* ]]; then
+        canonical="docker.io/library/${image_ref}"
+      elif [[ "${first}" != *.* && "${first}" != *:* && "${first}" != "localhost" ]]; then
+        canonical="docker.io/${image_ref}"
+      fi
+      grep -Fxq -- "${image_ref}" <<< "${refs}" || \
+        grep -Fxq -- "${canonical}" <<< "${refs}" || \
+        err "OCI archive ${archive} is missing image ${image_ref}"
+    done < "${list}"
+  done
+  local image_ref las_repo las_tag
+  for image_ref in "${OPERATOR_IMAGE}" "${SPLUNK_IMAGE}" "${SPLUNK_OPERATOR_IMAGE}" "${SLIM_API_IMAGE}"; do
+    grep -Fxq -- "${image_ref}" "${AIRGAP_K0S_IMAGE_DIR}/workload-images.list" || err "Pinned workload image missing from the air-gap bundle: ${image_ref}"
+  done
+  las_repo="$(yq eval '.aiPlatform.features[] | select(.name == "agentruntime") | .las.image.repository // ""' "${CONFIG_FILE}")"
+  las_tag="$(yq eval '.aiPlatform.features[] | select(.name == "agentruntime") | .las.image.tag // ""' "${CONFIG_FILE}")"
+  grep -Fxq -- "${las_repo}:${las_tag}" "${AIRGAP_K0S_IMAGE_DIR}/workload-images.list" || err "Pinned LAS image missing from the air-gap bundle"
+}
+
 validate_image_config() {
   log "Validating image configuration..."
 
@@ -892,7 +1021,7 @@ validate_image_config() {
       err "REQUIRED: images.ray.workerImage must be specified in k0s-cluster-config.yaml when components.kuberay=true"
     fi
   fi
-  if component_enabled ai-platform-cr; then
+  if component_enabled ai-platform-cr && [[ "${AI_PLATFORM_PROFILE:-}" != "cpuOnly" ]]; then
     if [[ -z "$WEAVIATE_IMAGE" || "$WEAVIATE_IMAGE" == "null" ]]; then
       err "REQUIRED: images.weaviate.image must be specified in k0s-cluster-config.yaml when components.aiPlatformCR=true"
     fi
@@ -956,7 +1085,9 @@ validate_image_config() {
     "images.ray.headImage:${RAY_HEAD_IMAGE}"
     "images.ray.workerImage:${RAY_WORKER_IMAGE}"
   )
-  component_enabled ai-platform-cr && mutable_tag_images+=("images.weaviate.image:${WEAVIATE_IMAGE}")
+  if component_enabled ai-platform-cr && [[ "${AI_PLATFORM_PROFILE:-}" != "cpuOnly" ]]; then
+    mutable_tag_images+=("images.weaviate.image:${WEAVIATE_IMAGE}")
+  fi
   k0s_saia_feature_enabled && mutable_tag_images+=(
     "images.saia.apiImage:${SAIA_API_IMAGE}"
     "images.saia.apiV2Image:${SAIA_API_V2_IMAGE}"
@@ -1123,14 +1254,11 @@ configure_images() {
   upsert_ai_operator_env "RELATED_IMAGE_NGINX" "$nginx_full"
   "${SED_INPLACE[@]}" "/name: MODEL_VERSION/,/value:/ s|value:.*|value: ${MODEL_VERSION}|" "$SPLUNK_AI_FILE"
   "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/value:/ s|value:.*|value: ${RAY_RUNTIME_VERSION}|" "$SPLUNK_AI_FILE"
-  # Anchor on the RAY_VERSION env entry (unique, always immediately precedes
-  # the operator container's image: line) rather than matching the image
-  # string's content. A content-based match like *splunk*ai*operator* only
-  # matches the pristine manifest's default image; once a custom
-  # image (e.g. a private registry with no such substring) has been written
-  # here, re-running install with a new tag would silently fail to match and
-  # leave the stale image in place.
-  "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/^        image:/ s|^        image:.*|        image: ${operator_escaped}|" "$SPLUNK_AI_FILE"
+  # Bundle rendering can re-indent YAML. Preserve the image line's actual
+  # indentation and fail if the configured image was not written.
+  "${SED_INPLACE[@]}" "/name: RAY_VERSION/,/^[[:space:]]*image:/ s|^\([[:space:]]*\)image:.*|\1image: ${operator_escaped}|" "$SPLUNK_AI_FILE"
+  grep -Fq -- "image: ${operator_full}" "$SPLUNK_AI_FILE" ||
+    err "Failed to render the configured Splunk AI Operator image"
 
 
   [[ -n "$ray_head_full" ]] && log "  ✓ Updated RELATED_IMAGE_RAY_HEAD: $ray_head_full"
@@ -1157,11 +1285,10 @@ configure_images() {
     local splunk_op_escaped=$(echo "$splunk_operator_full" | sed 's/[\/&]/\\&/g')
 
     "${SED_INPLACE[@]}" "/name: RELATED_IMAGE_SPLUNK_ENTERPRISE/,/value:/ s|value:.*|value: ${splunk_escaped}|" "$SPLUNK_OPERATOR_FILE"
-    # Same rationale as the AI operator image above: anchor on the unique
-    # POD_NAME env entry that always immediately precedes this container's
-    # image: line, instead of content-matching *splunk*operator* in the
-    # image string itself.
-    "${SED_INPLACE[@]}" "/name: POD_NAME/,/^        image:/ s|^        image:.*|        image: ${splunk_op_escaped}|" "$SPLUNK_OPERATOR_FILE"
+    # Preserve indentation after CPU-only bundle rendering as above.
+    "${SED_INPLACE[@]}" "/name: POD_NAME/,/^[[:space:]]*image:/ s|^\([[:space:]]*\)image:.*|\1image: ${splunk_op_escaped}|" "$SPLUNK_OPERATOR_FILE"
+    grep -Fq -- "image: ${splunk_operator_full}" "$SPLUNK_OPERATOR_FILE" ||
+      err "Failed to render the configured Splunk Operator image"
 
     log "  ✓ Updated Splunk Enterprise image: $splunk_full"
     log "  ✓ Updated Splunk Operator image: $splunk_operator_full"
@@ -1185,7 +1312,7 @@ object_store_auth_looks_like_placeholder() {
 # ====== PREFLIGHT CHECKS ======
 preflight_checks() {
   pf_header "Required tools"
-  for tool in ssh curl kubectl helm git jq; do
+  for tool in ssh curl kubectl helm jq; do
     if command -v "$tool" >/dev/null 2>&1; then
       pf_ok "$tool found"
     else
@@ -1308,11 +1435,10 @@ preflight_checks() {
   pf_header "Remote node SSH access"
   local _all_ips=()
   IFS=' ' read -ra _all_ips <<< "${EXISTING_CONTROLLER_IPS} ${EXISTING_WORKER_IPS}"
+  build_ssh_options
   for ip in "${_all_ips[@]}"; do
     [[ -z "$ip" ]] && continue
-    if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=10 -o BatchMode=yes \
-        ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${ip}" "echo ok" >/dev/null 2>&1; then
+    if ssh "${SSH_OPTIONS[@]}" "${SSH_USER}@${ip}" "echo ok" >/dev/null 2>&1; then
       pf_ok "SSH reachable: ${ip}"
     else
       pf_fail "Cannot SSH to ${ip} — check SSH key (${SSH_KEY_PATH}), user (${SSH_USER}), and network"
@@ -1329,20 +1455,24 @@ preflight_checks() {
 }
 
 # ====== SSH HELPER ======
+build_ssh_options() {
+  SSH_OPTIONS=(-o ConnectTimeout=10 -o BatchMode=yes)
+  if airgap_cpu_profile_selected; then
+    [[ -n "${SSH_KNOWN_HOSTS_FILE:-}" && -f "${SSH_KNOWN_HOSTS_FILE}" ]] || \
+      err "cpuOnly air-gap profile requires a pinned cluster.sshKnownHostsFile"
+    SSH_OPTIONS+=(-o StrictHostKeyChecking=yes -o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}")
+  else
+    SSH_OPTIONS+=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+  fi
+  [[ -n "${SSH_KEY_PATH:-}" ]] && SSH_OPTIONS+=(-i "${SSH_KEY_PATH}")
+}
+
 ssh_exec() {
   local host="$1"
   shift
   local cmd="$*"
-
-  if [[ -n "${SSH_KEY_PATH}" ]]; then
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=10 -o BatchMode=yes \
-        -i "${SSH_KEY_PATH}" "${SSH_USER}@${host}" "${cmd}"
-  else
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=10 -o BatchMode=yes \
-        "${SSH_USER}@${host}" "${cmd}"
-  fi
+  build_ssh_options
+  ssh "${SSH_OPTIONS[@]}" "${SSH_USER}@${host}" "${cmd}"
 }
 
 scp_file() {
@@ -1350,11 +1480,8 @@ scp_file() {
   local host="$2"
   local dest="$3"
 
-  if [[ -n "${SSH_KEY_PATH}" ]]; then
-    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "${SSH_KEY_PATH}" "${file}" "${SSH_USER}@${host}:${dest}"
-  else
-    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${file}" "${SSH_USER}@${host}:${dest}"
-  fi
+  build_ssh_options
+  scp "${SSH_OPTIONS[@]}" "${file}" "${SSH_USER}@${host}:${dest}"
 }
 
 # Stage pre-loaded container-image bundles onto a node so k0s auto-imports them
@@ -1370,19 +1497,28 @@ scp_file() {
 # at least one *.tar (set only by install_from_airgap_bundle.sh).
 stage_k0s_image_bundle() {
   local node_ip="$1"
+  if airgap_cpu_profile_selected; then
+    validate_airgap_cpu_bundle
+  fi
   [[ -n "${AIRGAP_K0S_IMAGE_DIR:-}" && -d "${AIRGAP_K0S_IMAGE_DIR}" ]] || return 0
   local _tars=( "${AIRGAP_K0S_IMAGE_DIR}"/*.tar )
   [[ -f "${_tars[0]}" ]] || return 0
-  ssh_exec "${node_ip}" "sudo mkdir -p /var/lib/k0s/images" \
-    || { warn "    Could not create /var/lib/k0s/images on ${node_ip} — images may fail to pull"; return 0; }
+  if ! ssh_exec "${node_ip}" "sudo mkdir -p /var/lib/k0s/images"; then
+    if airgap_cpu_profile_selected; then err "Could not create /var/lib/k0s/images on ${node_ip}"; fi
+    warn "    Could not create /var/lib/k0s/images on ${node_ip} — images may fail to pull"
+    return 0
+  fi
   local _tar _name
   for _tar in "${_tars[@]}"; do
     _name="$(basename "${_tar}")"
     log "    Staging image bundle ${_name} on ${node_ip} (/var/lib/k0s/images/)..."
     if scp_file "${_tar}" "${node_ip}" "/tmp/${_name}"; then
-      ssh_exec "${node_ip}" "sudo mv -f /tmp/${_name} /var/lib/k0s/images/${_name}" \
-        || warn "    Failed to place ${_name} on ${node_ip} — some images may fail to pull"
+      if ! ssh_exec "${node_ip}" "sudo mv -f /tmp/${_name} /var/lib/k0s/images/${_name}"; then
+        if airgap_cpu_profile_selected; then err "Failed to place ${_name} on ${node_ip}"; fi
+        warn "    Failed to place ${_name} on ${node_ip} — some images may fail to pull"
+      fi
     else
+      if airgap_cpu_profile_selected; then err "Failed to copy ${_name} to ${node_ip}"; fi
       warn "    Failed to copy ${_name} to ${node_ip} — some images may fail to pull"
     fi
   done
@@ -1424,9 +1560,9 @@ preflight_check_registry() {
 
   # ---- Step 1: TCP/TLS reachability ----
   # 200 → open registry; 401/403 → reachable but needs auth (expected); anything else → problem.
-  # Note: %{http_code} already outputs "000" on connection failure, so no || echo needed.
+  # %{http_code} outputs "000" on connection failure; retain it even when curl fails.
   local http_code
-  http_code=$(curl "${curl_opts[@]}" -o /dev/null -w "%{http_code}" "${ping_url}" 2>/dev/null)
+  http_code=$(curl "${curl_opts[@]}" -o /dev/null -w "%{http_code}" "${ping_url}" 2>/dev/null || true)
   case "${http_code}" in
     200|401|403)
       pf_ok "Registry reachable: ${ping_url} (HTTP ${http_code})"
@@ -1441,6 +1577,18 @@ preflight_check_registry() {
       pf_warn "Registry ${IMAGE_REGISTRY} answered HTTP ${http_code} on /v2/ ping (not a standard OCI response, but host is reachable). Proceeding to manifest check."
       ;;
   esac
+
+  if airgap_cpu_profile_selected; then
+    # Every selected image was checked against the staged OCI archives before
+    # preflight. An authenticated private registry may return 401 here while
+    # its pull Secret is provisioned separately after k0s exists. The offline
+    # install uses those preloaded images with IfNotPresent pull policy.
+    case "${http_code}" in
+      200|401|403) pf_ok "CPU-only images are present in the verified local OCI bundle; registry auth is not required for cold start" ;;
+      *) pf_fail "Private registry /v2/ did not return 200, 401, or 403; cannot confirm OCI registry availability" ;;
+    esac
+    return
+  fi
 
   # ---- Step 2: Auth + manifest pull for one representative image ----
   # Pick the first image that actually resolves to IMAGE_REGISTRY after applying
@@ -1660,8 +1808,10 @@ preflight_check_remote_deps() {
       pf_warn "${ip}: curl not found — k0s binary download will fail (pre-install k0s or install curl)"
     fi
 
-    # internet access to k0s install endpoint — only meaningful if curl is present
-    if ! ssh_exec "${ip}" "command -v curl >/dev/null 2>&1"; then
+    # A disconnected install must never probe or depend on a public endpoint.
+    if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+      pf_ok "${ip}: public k0s endpoint probe skipped in air-gap mode"
+    elif ! ssh_exec "${ip}" "command -v curl >/dev/null 2>&1"; then
       pf_warn "${ip}: skipping get.k0s.sh reachability check — curl is not installed"
     elif ssh_exec "${ip}" "curl -sf --connect-timeout 5 https://get.k0s.sh >/dev/null 2>&1"; then
       pf_ok "${ip}: internet access OK (get.k0s.sh reachable)"
@@ -1689,16 +1839,30 @@ prepare_nodes_for_k0s() {
       local _k0s_src="${K0S_INSTALL_URL#file://}"
       if [[ -f "${_k0s_src}" ]]; then
         log "    Copying bundled k0s binary to ${node_ip}:/tmp/k0s-airgap ..."
-        scp_file "${_k0s_src}" "${node_ip}" "/tmp/k0s-airgap" \
-          || warn "    Failed to copy k0s binary to ${node_ip} — node install may fail"
+        if ! scp_file "${_k0s_src}" "${node_ip}" "/tmp/k0s-airgap"; then
+          if airgap_cpu_profile_selected; then err "Failed to copy k0s binary to ${node_ip}"; fi
+          warn "    Failed to copy k0s binary to ${node_ip} — node install may fail"
+        fi
       else
+        if airgap_cpu_profile_selected; then err "Bundled k0s binary not found at ${_k0s_src}"; fi
         warn "    Bundled k0s binary not found at ${_k0s_src} — node will fall back to other install paths"
       fi
     fi
 
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      ${SSH_KEY_PATH:+-i "${SSH_KEY_PATH}"} "${SSH_USER}@${node_ip}" \
-      bash -s <<'REMOTE_SCRIPT' || warn "  Preparation had issues on ${node_ip}"
+    # Pass only a staged wheel basename across SSH. The installer-side path is
+    # inaccessible on the node and shell variables do not cross the heredoc.
+    local _remote_pyyaml_wheel=""
+    if airgap_cpu_profile_selected && [[ -n "${AIRGAP_PYYAML_WHEEL_PATH:-}" ]]; then
+      [[ -f "${AIRGAP_PYYAML_WHEEL_PATH}" ]] || err "Bundled PyYAML wheel is missing"
+      _remote_pyyaml_wheel="/tmp/$(basename "${AIRGAP_PYYAML_WHEEL_PATH}")"
+      scp_file "${AIRGAP_PYYAML_WHEEL_PATH}" "${node_ip}" "${_remote_pyyaml_wheel}" || err "Failed to copy PyYAML wheel to ${node_ip}"
+    fi
+
+    build_ssh_options
+    ssh "${SSH_OPTIONS[@]}" "${SSH_USER}@${node_ip}" \
+      bash -s -- "$(airgap_cpu_profile_selected && echo true || echo false)" "${_remote_pyyaml_wheel}" <<'REMOTE_SCRIPT' || { if airgap_cpu_profile_selected; then err "Preparation failed on ${node_ip}"; fi; warn "  Preparation had issues on ${node_ip}"; }
+      AIRGAP_CPU_STRICT="$1"
+      AIRGAP_PYYAML_WHEEL_PATH="$2"
       # Disable firewalld if active (blocks k0s ports: 6443, 10250, 8472, etc.)
       if systemctl is-active firewalld >/dev/null 2>&1; then
         echo 'Disabling firewalld...'
@@ -1721,6 +1885,11 @@ prepare_nodes_for_k0s() {
         echo "python3+pyyaml already present"
       else
         echo "Installing python3-pyyaml..."
+        if [[ "${AIRGAP_CPU_STRICT}" == "true" ]]; then
+          [[ -n "${AIRGAP_PYYAML_WHEEL_PATH}" && -f "${AIRGAP_PYYAML_WHEEL_PATH}" ]] || { echo "ERROR: offline PyYAML wheel or preinstalled PyYAML required" >&2; exit 1; }
+          sudo pip3 install --no-index "${AIRGAP_PYYAML_WHEEL_PATH}" >/dev/null || exit 1
+          python3 -c 'import yaml' || exit 1
+        else
         # In air-gap mode: prefer a pre-downloaded wheel if provided, then fall
         # back to the OS package manager (which will succeed if a local repo
         # mirror is configured on the node).  Internet-only paths are guarded
@@ -1737,6 +1906,7 @@ prepare_nodes_for_k0s() {
         else
           echo "WARN: no supported package manager (dnf/apt) found — python3-pyyaml may be missing"
         fi
+        fi
       fi
 
       # Install k0s binary if not present
@@ -1750,12 +1920,16 @@ prepare_nodes_for_k0s() {
         sudo cp /tmp/k0s-airgap /usr/local/bin/k0s && sudo chmod +x /usr/local/bin/k0s
         rm -f /tmp/k0s-airgap
       else
+        [[ "${AIRGAP_CPU_STRICT}" != "true" ]] || { echo "ERROR: bundled k0s binary missing" >&2; exit 1; }
         echo "Installing k0s binary..."
         if [[ -n "${K0S_INSTALL_URL:-}" && "${K0S_INSTALL_URL}" == file://* ]]; then
           sudo cp "${K0S_INSTALL_URL#file://}" /usr/local/bin/k0s && sudo chmod +x /usr/local/bin/k0s
         else
           curl -sSLf "${K0S_INSTALL_URL:-https://get.k0s.sh}" | sudo sh
         fi
+      fi
+      if [[ "${AIRGAP_CPU_STRICT}" == "true" ]]; then
+        command -v k0s >/dev/null 2>&1 || { echo "ERROR: k0s binary unavailable after local install" >&2; exit 1; }
       fi
 
       # Ensure k0s is in sudo secure_path
@@ -1798,16 +1972,8 @@ preflight_check_node_storage() {
   #   - 10s SSH timeout so a bad host doesn't stall the whole preflight.
   _get_avail_gb() {
     local ip="$1" out rc
-    local -a ssh_cmd=(
-      ssh
-      -o StrictHostKeyChecking=no
-      -o UserKnownHostsFile=/dev/null
-      -o ConnectTimeout=10
-      -o BatchMode=yes
-    )
-    if [ -n "${SSH_KEY_PATH:-}" ]; then
-      ssh_cmd+=(-i "$SSH_KEY_PATH")
-    fi
+    build_ssh_options
+    local -a ssh_cmd=(ssh "${SSH_OPTIONS[@]}")
     out=$(
       "${ssh_cmd[@]}" "${SSH_USER}@${ip}" \
         "avail_kb=\$(df -Pk /var/lib/k0s 2>/dev/null | awk 'NR==2 {print \$4}')
@@ -2632,15 +2798,33 @@ ensure_s3compat_credentials() {
   fi
   ensure_namespace "${AI_NS}"
   local secret_name="minio-credentials"
-  kubectl -n "${AI_NS}" create secret generic "${secret_name}" \
-    --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-    --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-    --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-    --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-    --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+  apply_s3compat_secret "${AI_NS}"
   log "✓ S3-compatible credentials secret ${AI_NS}/${secret_name} ready"
+}
+
+# Keep the application secret out of kubectl's process arguments. The installer
+# receives it through MINIO_ROOT_PASSWORD and sends only a manifest on stdin.
+apply_s3compat_secret() {
+  local ns="$1" access_b64 secret_b64
+  access_b64="$(printf '%s' "${MINIO_ROOT_USER}" | base64 | tr -d '\n')"
+  secret_b64="$(printf '%s' "${MINIO_ROOT_PASSWORD}" | base64 | tr -d '\n')"
+  cat <<EOF | kubectl -n "${ns}" apply -f - >/dev/null
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+  namespace: ${ns}
+type: Opaque
+data:
+  AWS_ACCESS_KEY_ID: ${access_b64}
+  AWS_SECRET_ACCESS_KEY: ${secret_b64}
+  s3_access_key: ${access_b64}
+  s3_secret_key: ${secret_b64}
+  MINIO_ACCESS_KEY: ${access_b64}
+  MINIO_SECRET_KEY: ${secret_b64}
+  accessKey: ${access_b64}
+  secretKey: ${secret_b64}
+EOF
 }
 
 # ====== MODEL ARTIFACT STAGING ======
@@ -4391,11 +4575,7 @@ create_minio_secret() {
 
   log "Creating MinIO credentials secret in ${ns}..."
 
-  kubectl create secret generic minio-credentials \
-    --namespace="${ns}" \
-    --from-literal=accessKey="${MINIO_ROOT_USER}" \
-    --from-literal=secretKey="${MINIO_ROOT_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl apply -f -
+  apply_s3compat_secret "${ns}"
 
   log "MinIO credentials secret created"
   echo "minio-credentials"
@@ -4685,14 +4865,7 @@ install_splunk_standalone() {
   # Ensure credentials secret exists for Splunk App Framework
   if ! kubectl get secret minio-credentials -n "${AI_NS}" &>/dev/null; then
     log "Creating minio-credentials secret in ${AI_NS}..."
-    kubectl -n "${AI_NS}" create secret generic minio-credentials \
-      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+    apply_s3compat_secret "${AI_NS}"
   fi
 
   # Create splunk-defaults ConfigMap (optional but recommended)
@@ -4811,8 +4984,13 @@ wait_for_splunk_standalone() {
   fi
 
   log "Waiting for Splunk Standalone to be ready..."
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=${AI_STANDALONE_NAME} -n ${AI_NS} --timeout=600s || true
-  log "Splunk Standalone is ready"
+  if kubectl wait --for=condition=ready pod -l "app.kubernetes.io/instance=${AI_STANDALONE_NAME}" -n "${AI_NS}" --timeout=600s; then
+    log "Splunk Standalone is ready"
+  elif airgap_cpu_profile_selected; then
+    err "Splunk Standalone did not become Ready in the air-gapped CPU-only cluster"
+  else
+    warn "Splunk Standalone readiness timed out"
+  fi
 }
 
 # ====== INSTALL AI PLATFORM CR ======
@@ -4857,7 +5035,7 @@ render_las_secret_refs() {
 # the resulting feature carries Secret references at the FeatureSpec level.
 render_las_feature_yaml() {
   local config_file="$1" feature_index="$2" network_mode="$3"
-  local repository tag assistant_id tracing_enabled tracing_endpoint
+  local repository tag assistant_id tracing_enabled tracing_endpoint langsmith_api_key_present
   local api_resources queue_resources autoscaling_enabled min_replicas max_replicas target_cpu
   local rendered="      las:"$'\n'
 
@@ -4866,6 +5044,23 @@ render_las_feature_yaml() {
   assistant_id=$(yq eval ".aiPlatform.features[${feature_index}].las.assistantId // \"\"" "${config_file}" 2>/dev/null || echo "")
   tracing_enabled=$(yq eval ".aiPlatform.features[${feature_index}].las.tracing.enabled // \"false\"" "${config_file}" 2>/dev/null || echo "false")
   tracing_endpoint=$(yq eval ".aiPlatform.features[${feature_index}].las.tracing.endpoint // \"\"" "${config_file}" 2>/dev/null || echo "")
+  langsmith_api_key_present=$(yq eval "(.aiPlatform.features[${feature_index}].las.credentials.langsmithApiKey // \"\") | length > 0" "${config_file}" 2>/dev/null || echo "false")
+  case "${network_mode}" in
+    connected|airgapped) ;;
+    *) echo "LAS network mode must be connected or airgapped" >&2; return 1 ;;
+  esac
+  case "${tracing_enabled}" in
+    true|false) ;;
+    *) echo "las.tracing.enabled must be true or false" >&2; return 1 ;;
+  esac
+  if [[ "${network_mode}" == "airgapped" && "${tracing_enabled}" == "true" ]]; then
+    echo "LAS tracing is not supported in airgapped mode" >&2
+    return 1
+  fi
+  if [[ "${network_mode}" == "airgapped" && "${langsmith_api_key_present}" == "true" ]]; then
+    echo "LAS LangSmith API key is not supported in airgapped mode" >&2
+    return 1
+  fi
   api_resources=$(yq eval ".aiPlatform.features[${feature_index}].las.api.resources // {}" "${config_file}" 2>/dev/null || echo "{}")
   queue_resources=$(yq eval ".aiPlatform.features[${feature_index}].las.queue.resources // {}" "${config_file}" 2>/dev/null || echo "{}")
   autoscaling_enabled=$(yq eval ".aiPlatform.features[${feature_index}].las.queue.autoscaling.enabled // \"false\"" "${config_file}" 2>/dev/null || echo "false")
@@ -4880,7 +5075,7 @@ render_las_feature_yaml() {
   rendered+="        networkMode: ${network_mode}"$'\n'
   rendered+="        tracing:"$'\n'
   rendered+="          enabled: ${tracing_enabled}"$'\n'
-  if [[ -n "${tracing_endpoint}" && "${tracing_endpoint}" != "null" ]]; then
+  if [[ "${tracing_enabled}" == "true" && -n "${tracing_endpoint}" && "${tracing_endpoint}" != "null" ]]; then
     rendered+="          endpoint: $(yaml_single_quote "${tracing_endpoint}")"$'\n'
   fi
 
@@ -4899,6 +5094,49 @@ render_las_feature_yaml() {
   rendered+="            maxReplicas: ${max_replicas}"$'\n'
   rendered+="            targetCPUUtilizationPercentage: ${target_cpu}"$'\n'
   printf '%s' "${rendered}"
+}
+
+wait_for_airgap_las_secrets() {
+  airgap_cpu_profile_selected || return 0
+  local timeout="${LAS_SECRET_WAIT_SECONDS:-1800}"
+  [[ "${timeout}" =~ ^[0-9]+$ ]] || err "LAS_SECRET_WAIT_SECONDS must be a nonnegative integer"
+  local feature_index=0 count name key ref missing deadline=$((SECONDS + timeout))
+  count="$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}")"
+  while (( feature_index < count )); do
+    if [[ "$(yq eval ".aiPlatform.features[${feature_index}].name" "${CONFIG_FILE}")" == "agentruntime" ]]; then
+      break
+    fi
+    feature_index=$((feature_index + 1))
+  done
+  (( feature_index < count )) || err "No agentruntime feature found for LAS Secret preflight"
+  local references=(
+    'licenseSecretRef:langgraph_cloud_license_key'
+    'postgresSecretRef:postgres_connection_url'
+    'redisSecretRef:redis_connection_url'
+  )
+  ensure_namespace "${AI_NS}"
+  log "Waiting for referenced LAS Secrets in ${AI_NS}; provision them from a separate trusted session. Secret values are never read into installer logs."
+  while true; do
+    missing=()
+    for ref in "${references[@]}"; do
+      name="$(yq eval ".aiPlatform.features[${feature_index}].${ref%%:*} // \"\"" "${CONFIG_FILE}")"
+      key="${ref#*:}"
+      [[ -n "${name}" && "${name}" != "null" ]] || err "Missing agentruntime ${ref%%:*}"
+      if ! kubectl -n "${AI_NS}" get secret "${name}" -o json 2>/dev/null |
+        jq -e --arg key "${key}" '.data[$key] != null and .data[$key] != ""' >/dev/null 2>&1; then
+        missing+=("${name}:${key}")
+      fi
+    done
+    if (( ${#missing[@]} == 0 )); then
+      log "All referenced LAS Secrets contain the required keys"
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      err "LAS Secrets unavailable: ${missing[*]}. Create them in ${AI_NS} and rerun install, or increase LAS_SECRET_WAIT_SECONDS."
+    fi
+    log "Awaiting LAS Secret keys: ${missing[*]}"
+    sleep 10
+  done
 }
 
 install_ai_platform_cr() {
@@ -5021,14 +5259,7 @@ EOF
       err "minio-credentials missing and cannot be created: fix objectStore.auth in ${CONFIG_FILE} (remove <...> placeholders)."
     fi
   else
-    kubectl -n "${AI_NS}" create secret generic minio-credentials \
-      --from-literal=AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}" \
-      --from-literal=AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=s3_access_key="${MINIO_ROOT_USER}" \
-      --from-literal=s3_secret_key="${MINIO_ROOT_PASSWORD}" \
-      --from-literal=MINIO_ACCESS_KEY="${MINIO_ROOT_USER}" \
-      --from-literal=MINIO_SECRET_KEY="${MINIO_ROOT_PASSWORD}" \
-      --dry-run=client -o yaml | kubectl -n "${AI_NS}" apply -f -
+    apply_s3compat_secret "${AI_NS}"
     log "✓ Object storage credentials secret ready"
   fi
 
@@ -5114,7 +5345,7 @@ EOF
 
   # Build features YAML from config file (reads aiPlatform.features[] array)
   local features_yaml=""
-  local feature_count las_feature_index las_credentials_json las_credentials_managed
+  local feature_count las_feature_index las_credentials_json las_credentials_managed las_network_mode
   feature_count=$(yq eval '.aiPlatform.features | length' "${CONFIG_FILE}" 2>/dev/null || echo "0")
   las_feature_index=""
   local _feature_index=0
@@ -5128,6 +5359,11 @@ EOF
   las_credentials_json='{"managed":false}'
   las_credentials_managed="false"
   if [[ -n "${las_feature_index}" ]]; then
+    las_network_mode="connected"
+    [[ "${AIRGAP_MODE:-false}" == "true" ]] && las_network_mode="airgapped"
+    if ! render_las_feature_yaml "${CONFIG_FILE}" "${las_feature_index}" "${las_network_mode}" >/dev/null; then
+      err "Invalid LAS runtime configuration. No LAS Secrets or AIPlatform configuration were applied."
+    fi
     local las_deployment_helper="$(dirname "${BASH_SOURCE[0]}")/las_deployment.py"
     local aiplatform_resource_name="${CLUSTER_NAME}-ai-platform"
     if ! las_credentials_json=$(python3 "${las_deployment_helper}" provision-secrets --config "${CONFIG_FILE}" --namespace "${AI_NS}" --platform "${aiplatform_resource_name}"); then
@@ -5144,7 +5380,7 @@ EOF
     log "Reading ${feature_count} feature(s) from config..."
     local i=0
     while [[ $i -lt $feature_count ]]; do
-      local fname fver fsa fprovider fenv_yaml flas_repository flas_tag fassistant_id las_ref las_value las_network_mode las_yaml
+      local fname fver fsa fprovider fenv_yaml flas_repository flas_tag fassistant_id las_ref las_value las_yaml
       fname=$(yq eval ".aiPlatform.features[$i].name" "${CONFIG_FILE}" 2>/dev/null || echo "")
       fver=$(yq eval ".aiPlatform.features[$i].version // \"1.0.0\"" "${CONFIG_FILE}" 2>/dev/null || echo "1.0.0")
       fsa=$(yq eval ".aiPlatform.features[$i].serviceAccountName // \"\"" "${CONFIG_FILE}" 2>/dev/null || echo "")
@@ -5163,8 +5399,6 @@ EOF
           features_yaml+="$(render_las_secret_refs "${CONFIG_FILE}" "$i" false '{}')"$'\n'
         fi
         if [[ "${fname}" == "agentruntime" ]]; then
-          las_network_mode="connected"
-          [[ "${AIRGAP_MODE:-false}" == "true" ]] && las_network_mode="airgapped"
           las_yaml=$(render_las_feature_yaml "${CONFIG_FILE}" "${i}" "${las_network_mode}")
           # Command substitution strips trailing newlines from the renderer output.
           features_yaml+="${las_yaml}"$'\n'
@@ -5187,12 +5421,23 @@ EOF
 
   # Apply AIPlatform CR (matching EKS script pattern)
   log "Applying AIPlatform CR: ${CLUSTER_NAME}-ai-platform"
+  local profile_yaml="" accelerator_yaml="" storage_yaml="" worker_yaml="" gpu_scheduler_yaml=""
+  if [[ "${AI_PLATFORM_PROFILE:-}" == "cpuOnly" ]]; then
+    profile_yaml="  profile: cpuOnly"$'\n'
+    scale_factor_yaml=""
+  else
+    accelerator_yaml="  defaultAcceleratorType: ${DEFAULT_ACCELERATOR}"$'\n'
+    storage_yaml="  storage:"$'\n'"    vectorDB:"$'\n'"      size: ${VECTORDB_SIZE}"$'\n'"      storageClassName: ${STORAGE_CLASS}"$'\n'
+    worker_yaml="  workerGroupConfig:"$'\n'"    imageRegistry: \"${WORKER_IMAGE_REGISTRY}\""$'\n'
+    gpu_scheduler_yaml="  gpuScheduler:"$'\n'"    nodeSelector:"$'\n'"      splunk.ai/workload-type: gpu"$'\n'"    tolerations:"$'\n'"      - key: \"nvidia.com/gpu\""$'\n'"        operator: \"Equal\""$'\n'"        value: \"true\""$'\n'"        effect: \"NoSchedule\""$'\n'
+  fi
   cat <<YAML | kubectl -n "${AI_NS}" apply --server-side --force-conflicts -f -
 apiVersion: ai.splunk.com/v1
 kind: AIPlatform
 metadata:
   name: ${CLUSTER_NAME}-ai-platform
 spec:
+${profile_yaml}
   objectStorage:
     path: ${obj_path}
     region: ${REGION:-${ECR_REGION:-us-east-1}}
@@ -5203,10 +5448,7 @@ spec:
   images:
 ${image_pull_secrets}
 
-  # GPU accelerator type (determines Ray worker tiers: L40S or empty for no workers)
-  defaultAcceleratorType: ${DEFAULT_ACCELERATOR}
-
-  # Platform-wide capacity multiplier (scales model replicas + GPU worker pods)
+${accelerator_yaml}
 ${scale_factor_yaml}
   # Sidecar injection configuration
   sidecars:
@@ -5218,15 +5460,8 @@ ${scale_factor_yaml}
   features:
 ${features_yaml}
 ${svc_template_yaml}
-  # Storage configuration
-  storage:
-    vectorDB:
-      size: ${VECTORDB_SIZE}
-      storageClassName: ${STORAGE_CLASS}
-
-  # Worker configuration
-  workerGroupConfig:
-    imageRegistry: "${WORKER_IMAGE_REGISTRY}"
+${storage_yaml}
+${worker_yaml}
 
   # CPU scheduler
   cpuScheduler:
@@ -5234,15 +5469,7 @@ ${svc_template_yaml}
       splunk.ai/workload-type: cpu
     tolerations: []
 
-  # GPU scheduler
-  gpuScheduler:
-    nodeSelector:
-      splunk.ai/workload-type: gpu
-    tolerations:
-      - key: "nvidia.com/gpu"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
+${gpu_scheduler_yaml}
 ${splunk_config_yaml}
 YAML
 
@@ -5764,6 +5991,7 @@ install_ai_platform_stack() {
     log "Splunk AI Operator skipped (components.aiOperator=false)"
   fi
   if component_enabled ai-platform-cr; then
+    wait_for_airgap_las_secrets
     install_ai_platform_cr
     patch_k0s_saia_public_service_workaround
     # Expose slim on its own NodePort when the feature is enabled (no-op otherwise).
@@ -6959,6 +7187,9 @@ main_install() {
 
   load_config
 
+  validate_airgap_cpu_profile
+  validate_airgap_cpu_bundle
+
   validate_image_config
   resolve_accelerator_type
   configure_images
@@ -7199,6 +7430,9 @@ main_install() {
   # The banner already tells the operator what's wrong; failing the exit
   # code on top of that just breaks automation.
   show_platform_access_info || true
+  if [[ "${AI_PLATFORM_PROFILE:-}" == "cpuOnly" && "${VERIFY_RC}" != "0" ]]; then
+    err "CPU-only installation is incomplete: pod or workload readiness verification failed"
+  fi
 }
 
 # ====== MAIN DELETE FLOW ======
@@ -7478,6 +7712,7 @@ diagnose() {
 # Config completeness check — catches problems before a 40-min install run.
 validate_config() {
   load_config
+  validate_airgap_cpu_profile
 
   echo -e "\n\033[1;34m[VALIDATE]\033[0m Checking configuration completeness...\n" >&2
   local errors=0 warnings=0
@@ -7516,21 +7751,23 @@ validate_config() {
   img_reg=$(yq eval '.images.registry // ""' "${CONFIG_FILE}" 2>/dev/null)
   img_op=$(yq eval  '.images.operator.image // ""' "${CONFIG_FILE}" 2>/dev/null)
   _vcheck "images.operator.image" "${img_op}" "" "your splunk-ai-operator image"
-  _vcheck "aiPlatform.defaultAcceleratorType" \
-    "$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null)" \
-    "" "$(IFS=\|; echo "${SUPPORTED_ACCELERATORS[*]}")"
-  local _accel_val
-  _accel_val=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-  if [[ -n "${_accel_val}" ]]; then
-    local _valid=false
-    for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
-      local _t_lower
-      _t_lower=$(printf '%s' "${_t}" | tr '[:upper:]' '[:lower:]')
-      [[ "${_accel_val}" == "${_t_lower}" ]] && _valid=true && break
-    done
-    if ! ${_valid}; then
-      echo -e "  \033[1;31m✖\033[0m aiPlatform.defaultAcceleratorType: unsupported value '${_accel_val}' — must be one of: ${SUPPORTED_ACCELERATORS[*]}" >&2
-      errors=$(( errors + 1 ))
+  if [[ "${AI_PLATFORM_PROFILE:-}" != "cpuOnly" ]]; then
+    _vcheck "aiPlatform.defaultAcceleratorType" \
+      "$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null)" \
+      "" "$(IFS=\|; echo "${SUPPORTED_ACCELERATORS[*]}")"
+    local _accel_val
+    _accel_val=$(yq eval '.aiPlatform.defaultAcceleratorType // ""' "${CONFIG_FILE}" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if [[ -n "${_accel_val}" ]]; then
+      local _valid=false
+      for _t in "${SUPPORTED_ACCELERATORS[@]}"; do
+        local _t_lower
+        _t_lower=$(printf '%s' "${_t}" | tr '[:upper:]' '[:lower:]')
+        [[ "${_accel_val}" == "${_t_lower}" ]] && _valid=true && break
+      done
+      if ! ${_valid}; then
+        echo -e "  \033[1;31m✖\033[0m aiPlatform.defaultAcceleratorType: unsupported value '${_accel_val}' — must be one of: ${SUPPORTED_ACCELERATORS[*]}" >&2
+        errors=$(( errors + 1 ))
+      fi
     fi
   fi
   local scale_factor_error

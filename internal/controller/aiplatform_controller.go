@@ -29,8 +29,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -195,9 +197,6 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			DeleteFunc: func(e event.DeleteEvent) bool { return !e.DeleteStateUnknown },
 		})).
 		// Infra owned by AIPlatform itself - with specific predicates
-		// Ray resources - only reconcile on generation changes
-		Owns(&rayv1.RayService{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
-		Owns(&rayv1.RayCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// Weaviate pieces - whatever we create at the platform level
 		Owns(&appsv1.StatefulSet{}, builder.WithPredicates(common.StatefulSetChangedPredicate())). // if platform creates Weaviate as a StatefulSet
 		Owns(&appsv1.Deployment{}, builder.WithPredicates(common.DeploymentChangedPredicate())).   // or a Deployment, if that's how we run it
@@ -212,15 +211,52 @@ func (r *AIPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			MaxConcurrentReconciles: aiv1.TotalWorker,
 		})
 
+	// A CPU-only installation does not install KubeRay or its CRDs. Register Ray
+	// watches only when the corresponding APIs exist; full installations retain
+	// the same reconciliation behavior.
+	for _, optional := range []struct {
+		kind string
+		obj  client.Object
+	}{
+		{"RayService", &rayv1.RayService{}},
+		{"RayCluster", &rayv1.RayCluster{}},
+	} {
+		present, err := optionalResourcePresent(mgr, "ray.io", "v1", optional.kind)
+		if err != nil {
+			return err
+		}
+		if present {
+			b = b.Owns(optional.obj, builder.WithPredicates(predicate.GenerationChangedPredicate{}))
+		}
+	}
+
 	return b.Complete(r)
+}
+
+func optionalResourcePresent(mgr ctrl.Manager, group, version, kind string) (bool, error) {
+	_, err := mgr.GetRESTMapper().RESTMapping(schema.GroupKind{Group: group, Kind: kind}, version)
+	if meta.IsNoMatchError(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func aiServiceReadyChanged(oldService, newService *aiv1.AIService) bool {
 	if oldService == nil || newService == nil {
 		return false
 	}
-	if oldService.Spec.Feature.LAS == nil && newService.Spec.Feature.LAS == nil {
+	if oldService.Spec.Feature.LAS == nil && newService.Spec.Feature.LAS == nil &&
+		oldService.Spec.Feature.Name != "slim" && newService.Spec.Feature.Name != "slim" {
 		return false
+	}
+	// SLIM reports the observed generation on AIService status rather than on
+	// individual conditions. Wake the parent after a successful child update
+	// even when Ready remained true throughout reconciliation.
+	if oldService.Status.ObservedGeneration != newService.Status.ObservedGeneration {
+		return true
 	}
 	oldReady := findReadyCondition(oldService.Status.Conditions)
 	newReady := findReadyCondition(newService.Status.Conditions)

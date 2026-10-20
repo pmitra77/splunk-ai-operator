@@ -43,7 +43,7 @@ var aiservicelog = logf.Log.WithName("aiservice-resource")
 // SetupAIServiceWebhookWithManager registers the webhook for AIService in the manager.
 func SetupAIServiceWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).For(&aiv1.AIService{}).
-		WithValidator(&AIServiceCustomValidator{}).
+		WithValidator(&AIServiceCustomValidator{Client: mgr.GetAPIReader()}).
 		WithDefaulter(&AIServiceCustomDefaulter{}).
 		Complete()
 }
@@ -120,7 +120,7 @@ func (d *AIServiceCustomDefaulter) Default(_ context.Context, obj runtime.Object
 // NOTE: The +kubebuilder:object:generate=false marker prevents controller-gen from generating DeepCopy methods,
 // as this struct is used only for temporary operations and does not need to be deeply copied.
 type AIServiceCustomValidator struct {
-	Client client.Client
+	Client client.Reader
 }
 
 var _ webhook.CustomValidator = &AIServiceCustomValidator{}
@@ -144,25 +144,10 @@ func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, obj runti
 		))
 	}
 
-	// Validate VectorDbUrl is required
-	if aiservice.Spec.VectorDbUrl == "" {
-		allErrs = append(allErrs, field.Required(
-			field.NewPath("spec").Child("vectorDbUrl"),
-			"vectorDbUrl must be specified",
-		))
+	if errs, err := v.validateVectorDBURL(ctx, aiservice); err != nil {
+		return warnings, err
 	} else {
-		// TODO: Temporarily disabled - allow service names without http:// prefix
-		// This validation was preventing valid Kubernetes service names from being used
-		// We may want to add smarter validation later that distinguishes between URLs and service names
-		/*
-			if !strings.HasPrefix(aiservice.Spec.VectorDbUrl, "http://") && !strings.HasPrefix(aiservice.Spec.VectorDbUrl, "https://") {
-				allErrs = append(allErrs, field.Invalid(
-					field.NewPath("spec").Child("vectorDbUrl"),
-					aiservice.Spec.VectorDbUrl,
-					"vectorDbUrl must start with http:// or https://",
-				))
-			}
-		*/
+		allErrs = append(allErrs, errs...)
 	}
 
 	// Validate TaskVolume
@@ -212,6 +197,36 @@ func (v *AIServiceCustomValidator) ValidateCreate(ctx context.Context, obj runti
 	}
 
 	return warnings, nil
+}
+
+func (v *AIServiceCustomValidator) validateVectorDBURL(ctx context.Context, aiservice *aiv1.AIService) (field.ErrorList, error) {
+	if aiservice.Spec.VectorDbUrl != "" {
+		return nil, nil
+	}
+
+	required := field.ErrorList{field.Required(field.NewPath("spec").Child("vectorDbUrl"), "vectorDbUrl must be specified for full-profile services")}
+	if aiservice.Spec.Feature.Name != "slim" && aiservice.Spec.Feature.Name != "agentruntime" {
+		return required, nil
+	}
+	if aiservice.Spec.AIPlatformRef.Name == "" {
+		return required, nil
+	}
+	if v.Client == nil {
+		return nil, fmt.Errorf("AIService webhook cannot resolve AIPlatform profile: API reader is not configured")
+	}
+
+	namespace := aiservice.Spec.AIPlatformRef.Namespace
+	if namespace == "" {
+		namespace = aiservice.Namespace
+	}
+	platform := &aiv1.AIPlatform{}
+	if err := v.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: aiservice.Spec.AIPlatformRef.Name}, platform); err != nil {
+		return nil, fmt.Errorf("resolve AIPlatform %s/%s for vectorDbUrl validation: %w", namespace, aiservice.Spec.AIPlatformRef.Name, err)
+	}
+	if platform.Spec.Profile == aiv1.AIPlatformProfileCPUOnly {
+		return nil, nil
+	}
+	return required, nil
 }
 
 func (v *AIServiceCustomValidator) validateAgentRuntimeFields(aiservice *aiv1.AIService, fldPath *field.Path) field.ErrorList {

@@ -5204,7 +5204,6 @@ spec:
                 type: string
             required:
             - aiPlatformRef
-            - vectorDbUrl
             type: object
           status:
             description: AIServiceStatus defines the observed state of AIService

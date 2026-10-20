@@ -118,6 +118,76 @@ func TestSlimDeploymentSeparatesLASAndModelEndpoints(t *testing.T) {
 	}
 }
 
+func TestSlimDeploymentPreservesServerDefaultsAndRevisionWithoutRollout(t *testing.T) {
+	ctx := context.Background()
+	scheme := buildTestScheme(t)
+	platform := &aiv1.AIPlatform{
+		ObjectMeta: metav1.ObjectMeta{Name: "launchpad", Namespace: "ai-platform"},
+		Spec: aiv1.AIPlatformSpec{Features: []aiv1.FeatureSpec{
+			{Name: "agentruntime", Provider: "mltk", LAS: &aiv1.LASFeatureSpec{AssistantID: "echo"}},
+		}},
+	}
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "launchpad-slim", Namespace: "ai-platform", UID: types.UID("slim-uid")},
+		Spec: aiv1.AIServiceSpec{
+			AIPlatformRef:      corev1.ObjectReference{Name: platform.Name, Namespace: platform.Namespace},
+			ServiceAccountName: "launchpad-slim-sa",
+			Replicas:           1,
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(platform, ai).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+	t.Setenv("RELATED_IMAGE_SLIM_API", "slim:test")
+	require.NoError(t, r.reconcileSlimConfigMap(ctx, ai))
+	require.NoError(t, r.reconcileSlimDeployment(ctx, ai))
+
+	key := types.NamespacedName{Name: ai.Name + "-slim-deployment", Namespace: ai.Namespace}
+	deployment := &appsv1.Deployment{}
+	require.NoError(t, fakeClient.Get(ctx, key, deployment))
+	if deployment.Annotations == nil {
+		deployment.Annotations = map[string]string{}
+	}
+	deployment.Annotations["deployment.kubernetes.io/revision"] = "7"
+	// Simulate the defaults supplied by the API server to a stored Deployment.
+	template := &deployment.Spec.Template.Spec
+	template.DNSPolicy = corev1.DNSClusterFirst
+	template.RestartPolicy = corev1.RestartPolicyAlways
+	template.SchedulerName = "default-scheduler"
+	grace := int64(30)
+	template.TerminationGracePeriodSeconds = &grace
+	serviceLinks := true
+	template.EnableServiceLinks = &serviceLinks
+	container := &template.Containers[0]
+	container.TerminationMessagePath = "/dev/termination-log"
+	container.TerminationMessagePolicy = corev1.TerminationMessageReadFile
+	for i := range container.Ports {
+		container.Ports[i].Protocol = corev1.ProtocolTCP
+	}
+	for _, probe := range []*corev1.Probe{container.LivenessProbe, container.ReadinessProbe, container.StartupProbe} {
+		probe.TimeoutSeconds = 1
+		probe.SuccessThreshold = 1
+		probe.HTTPGet.Scheme = corev1.URISchemeHTTP
+	}
+	defaultMode := int32(420)
+	template.Volumes[0].ConfigMap.DefaultMode = &defaultMode
+	require.NoError(t, fakeClient.Update(ctx, deployment))
+	require.NoError(t, fakeClient.Get(ctx, key, deployment))
+	storedVersion := deployment.ResourceVersion
+	storedTemplate := deployment.Spec.Template.DeepCopy()
+
+	require.NoError(t, r.reconcileSlimDeployment(ctx, ai))
+	require.NoError(t, fakeClient.Get(ctx, key, deployment))
+	require.Equal(t, *storedTemplate, deployment.Spec.Template)
+	require.Equal(t, storedVersion, deployment.ResourceVersion, "unchanged desired config must not write Deployment")
+	require.Equal(t, "7", deployment.Annotations["deployment.kubernetes.io/revision"])
+
+	ai.Annotations = map[string]string{"example.com/rollout": "next"}
+	require.NoError(t, r.reconcileSlimDeployment(ctx, ai))
+	require.NoError(t, fakeClient.Get(ctx, key, deployment))
+	require.NotEqual(t, storedVersion, deployment.ResourceVersion, "changed desired annotations must roll Deployment")
+	require.Equal(t, "next", deployment.Spec.Template.Annotations["example.com/rollout"])
+}
+
 func TestAgentRuntimeURLRejectsMissingOrAmbiguousFeature(t *testing.T) {
 	scheme := buildTestScheme(t)
 	for _, tc := range []struct {

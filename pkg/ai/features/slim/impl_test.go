@@ -26,6 +26,31 @@ func buildTestScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
+func TestReconcileServiceAccount_ParentDefaultCreatesOwnedAccountWithoutSpecWrite(t *testing.T) {
+	ctx := context.Background()
+	scheme := buildTestScheme(t)
+	ai := &aiv1.AIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-ai-slim", Namespace: "default", UID: types.UID("slim-uid")},
+		Spec:       aiv1.AIServiceSpec{ServiceAccountName: "my-ai-slim-sa"},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ai).Build()
+	r := &SlimReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+	originalVersion := ai.ResourceVersion
+	require.NoError(t, r.reconcileServiceAccount(ctx, ai))
+	stored := &aiv1.AIService{}
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: ai.Name, Namespace: ai.Namespace}, stored))
+	require.Equal(t, originalVersion, stored.ResourceVersion)
+	require.Equal(t, ai.Spec.ServiceAccountName, stored.Spec.ServiceAccountName)
+	sa := &corev1.ServiceAccount{}
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: "my-ai-slim-sa", Namespace: ai.Namespace}, sa))
+	require.True(t, metav1.IsControlledBy(sa, ai))
+
+	accountVersion := sa.ResourceVersion
+	require.NoError(t, r.reconcileServiceAccount(ctx, ai))
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: sa.Name, Namespace: sa.Namespace}, sa))
+	require.Equal(t, accountVersion, sa.ResourceVersion, "an unchanged ServiceAccount must not be rewritten")
+}
+
 func Test_reconcileSlimService_ServiceTypeVariations(t *testing.T) {
 	// Slim mirrors SAIA's contract: the customer's k0s-cluster-config.yaml can
 	// omit / empty / explicitly-set serviceTemplate and get the expected

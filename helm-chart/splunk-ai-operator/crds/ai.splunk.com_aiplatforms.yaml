@@ -5406,6 +5406,15 @@ spec:
                 - path
                 - region
                 type: object
+              profile:
+                description: |-
+                  Profile selects the platform infrastructure to reconcile. Omitted or
+                  "full" keeps model serving; "cpuOnly" runs feature services without Ray
+                  or Weaviate.
+                enum:
+                - full
+                - cpuOnly
+                type: string
               scaleFactor:
                 default: 1
                 description: |-
@@ -6055,7 +6064,6 @@ spec:
                         minLength: 1
                         type: string
                       size:
-                        default: 50Gi
                         description: Size of the volume to create if PVCName is not
                           provided
                         pattern: ^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$

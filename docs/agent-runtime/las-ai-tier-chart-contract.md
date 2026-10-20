@@ -26,7 +26,7 @@ Secret data keys expected by chart `0.3.4`:
 | `postgres.external.existingSecretName` | `postgres_connection_url` | `POSTGRES_URI` |
 | `redis.external.existingSecretName` | `redis_connection_url` | `REDIS_URI` |
 
-With those existing Secret names set, chart templates reference those Secrets and skip generating replacement Secrets. Do not put credentials in values. Both API and queue Deployments consume PostgreSQL, Redis, and license Secret references. If a LangSmith API key is not needed, omit `api_key`; the chart marks that environment variable optional. The standalone server uses its license key at startup and requires egress to `https://beacon.langchain.com`; the POC environment has that egress.
+With those existing Secret names set, chart templates reference those Secrets and skip generating replacement Secrets. Do not put credentials in values. Both API and queue Deployments consume PostgreSQL, Redis, and license Secret references. If a LangSmith API key is not needed, omit `api_key`; the chart marks that environment variable optional. The POC environment could reach `https://beacon.langchain.com`, but this chart check did not establish that the supplied license requires public verifier egress. LangChain later confirmed offline entitlement for the supplied key with POC Agent Server runtime `0.15.1`; a network-disabled key validator accepted it. Neither result qualifies full API/queue startup. A selected release image still needs vendor confirmation and full API/queue cold-start and restart validation with public access denied. See [AIP-5404](https://splunk.atlassian.net/browse/AIP-5404) for the decision record.
 
 ## Expected rendered resources from the tagged templates
 

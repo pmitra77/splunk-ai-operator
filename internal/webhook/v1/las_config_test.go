@@ -101,6 +101,39 @@ func TestLASFeatureRejectsInvalidRuntimeSettings(t *testing.T) {
 	}
 }
 
+func TestLASFeatureTracingFollowsNetworkMode(t *testing.T) {
+	path := field.NewPath("spec", "features").Index(0).Child("las")
+	for _, tt := range []struct {
+		name        string
+		networkMode string
+		tracing     *aiv1.LASTracingSpec
+		wantReject  bool
+	}{
+		{name: "airgapped tracing omitted", networkMode: "airgapped"},
+		{name: "airgapped tracing disabled", networkMode: "airgapped", tracing: &aiv1.LASTracingSpec{Enabled: false}},
+		{name: "airgapped disabled endpoint ignored", networkMode: "airgapped", tracing: &aiv1.LASTracingSpec{Enabled: false, Endpoint: "https://unused.internal"}},
+		{name: "airgapped public tracing rejected", networkMode: "airgapped", tracing: &aiv1.LASTracingSpec{Enabled: true, Endpoint: "https://api.smith.langchain.com"}, wantReject: true},
+		{name: "airgapped internal tracing rejected", networkMode: "airgapped", tracing: &aiv1.LASTracingSpec{Enabled: true, Endpoint: "https://langsmith.internal"}, wantReject: true},
+		{name: "connected tracing allowed", networkMode: "connected", tracing: &aiv1.LASTracingSpec{Enabled: true, Endpoint: "https://langsmith.internal"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			las := fixtureLASForWebhookTest()
+			las.NetworkMode = tt.networkMode
+			las.Tracing = tt.tracing
+			errs := validateLASFeature(las, path)
+			if !tt.wantReject {
+				if len(errs) != 0 {
+					t.Fatalf("unexpected validation errors: %v", errs)
+				}
+				return
+			}
+			if len(errs) != 1 || errs[0].Field != "spec.features[0].las.tracing.enabled" || errs[0].Type != field.ErrorTypeForbidden {
+				t.Fatalf("airgapped tracing errors = %v, want one forbidden tracing.enabled error", errs)
+			}
+		})
+	}
+}
+
 func TestLASFeatureAllowsQueueWithoutCPURequestWhenAutoscalingDisabled(t *testing.T) {
 	las := fixtureLASForWebhookTest()
 	las.Queue.Autoscaling.Enabled = boolPtrLAS(false)

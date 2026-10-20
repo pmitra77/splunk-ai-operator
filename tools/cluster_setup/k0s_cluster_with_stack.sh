@@ -111,8 +111,8 @@ config_bool() {
   [[ "${value}" == "true" ]] && echo "true" || echo "false"
 }
 
-# The offline bundle forces air-gapped mode. Otherwise the deployment file
-# selects the mode; a false environment override cannot make it connected.
+# The offline bundle sets AIRGAP_MODE=true. Otherwise cluster.airgap selects
+# the mode; a false environment override cannot disable configured air-gap mode.
 resolve_airgap_mode() {
   local config_file="$1" override="${2:-}" configured configured_type
   configured_type=$(yq eval '.cluster.airgap | tag' "${config_file}") || return 1
@@ -655,7 +655,7 @@ Run 'yq eval . ${CONFIG_FILE}' for details, then fix the line and retry."
     err "cluster.apiExternalAddress must be an IP address or hostname without a URL scheme"
   fi
 
-  # install_from_airgap_bundle.sh sets AIRGAP_MODE=true automatically.
+  # The offline bundle sets AIRGAP_MODE=true; direct installs use cluster.airgap.
   local resolved_airgap
   if ! resolved_airgap=$(resolve_airgap_mode "${CONFIG_FILE}" "${AIRGAP_MODE:-}"); then
     err "Invalid cluster.airgap or AIRGAP_MODE configuration"

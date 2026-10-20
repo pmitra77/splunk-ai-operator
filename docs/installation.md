@@ -297,48 +297,71 @@ kubectl get certificates -n splunk-ai-operator-system
 
 ---
 
-## LAS deployment credentials and egress
+## LAS deployment mode, credentials, and egress
 
 For k0s deployments, put LAS deployment credentials under the AgentRuntime
 feature in the deployment configuration file. The installer validates the
 required PostgreSQL URI, Redis URI and license key, creates three namespace
 Secrets, then applies the AIPlatform with only their generated Secret names.
-`langsmithApiKey` is optional. Do not put real credentials in checked-in sample
-files or generated AIPlatform YAML. Keep populated deployment files private.
+Do not put real credentials in checked-in sample files or generated AIPlatform
+YAML. Keep populated deployment files private.
+
+`cluster.airgap: true` selects `las.networkMode: airgapped`; omitting it or
+setting it to `false` selects `connected`. The air-gap bundle installer also
+selects air-gapped mode. Network-mode selection is independent of the AI
+Platform `full` and `cpuOnly` profiles. Either profile can use air-gapped mode.
+For this release, LAS tracing
+is disabled: `las.tracing.enabled: true` is rejected in air-gapped mode. The
+supported air-gapped configuration does not supply a LangSmith API key.
+Connected deployments may configure tracing separately when needed.
 
 ```yaml
 cluster:
+  airgap: true
   egress:
     allowedIPs:
-      - "10.20.30.40" # Approved external MCP destination, if needed
+      - "10.20.30.40" # Approved internal PostgreSQL destination, if external to the cluster
+      - "10.20.30.41" # Approved internal Redis destination, if external to the cluster
+      - "10.20.30.42" # Approved internal MCP destination, if needed
 aiPlatform:
   name: product-ai-tier
   features:
     - name: agentruntime
       provider: mltk
       las:
+        tracing:
+          enabled: false
         credentials:
           licenseKey: "REPLACE_WITH_LICENSE_KEY"
-          postgresUri: "postgresql://USER:PASSWORD@postgres.internal:5432/las"
-          redisUri: "rediss://USER:PASSWORD@redis.internal:6379/0"
-          # Optional, only if LAS tracing needs LangSmith access.
-          langsmithApiKey: "REPLACE_WITH_LANGSMITH_API_KEY"
+          postgresUri: "REPLACE_WITH_POSTGRES_URI"
+          redisUri: "REPLACE_WITH_REDIS_URI"
 ```
 
 Reapplying the same file leaves unchanged Secrets untouched. Reapplying changed
 credentials updates the managed Secrets before the AIPlatform references are
-applied; removing the optional LangSmith key removes its Secret data key. The
-installer refuses to overwrite same-name Secrets it does not own. Deleting an
-AIService or Helm release retains these deployment-managed Secrets.
+applied. In connected mode, the optional `langsmithApiKey` is only for
+deployments that require LangSmith access; removing it removes its Secret data
+key. The installer refuses to overwrite same-name Secrets it does not own.
+Deleting an AIService or Helm release retains these deployment-managed Secrets.
+
+The LangChain license confirmation and offline key check cover POC Agent Server
+runtime `0.15.1` only. They do not certify a later release image. Confirm the
+selected release image against that license, then validate full API and queue
+cold start and restart without public access before claiming an air-gapped
+runtime deployment is qualified.
 
 When `cluster.egress.allowedIPs` is present, the installer manages a NetworkPolicy
 for the LAS API and queue Pods. It permits in-cluster Pod traffic, cluster DNS,
 and the listed destination IPs/CIDRs; plain IPs are normalized to host CIDRs and
 catch-all routes are rejected. An empty list permits only the internal baseline.
+List every required internal dependency outside in-cluster Pod traffic,
+including PostgreSQL, Redis, and MCP destinations as applicable. The example
+addresses are placeholders and must be replaced with approved destinations.
 Omitting the field removes only the matching policy managed by this deployment
-and keeps the prior unrestricted behavior. This policy does not replace upstream
-firewall rules or Splunk stack ingress controls. The cluster must have a network
-plugin that enforces NetworkPolicies.
+and keeps the prior unrestricted behavior. `cluster.airgap` selects installer
+and LAS configuration; it does not by itself deny public traffic. The policy
+does not replace upstream firewall rules or Splunk stack ingress controls. The
+cluster must have a network plugin that enforces NetworkPolicies.
 
 If queue autoscaling is enabled and the Kubernetes resource metrics API is not
 available, installation reports that metrics-server is needed; the LAS release

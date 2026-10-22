@@ -16,11 +16,6 @@ import uuid
 from types import SimpleNamespace
 from typing import Any
 
-from slim_api.models.aws import CreateAgentPayload, InvokeAgentPayload
-from slim_api.routers.las_agent import create_agent, delete_agent, invoke_agent
-from slim_api.util.las_client import get_las_client
-
-
 def jsonable(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
@@ -95,6 +90,9 @@ class Capture(logging.Handler):
 
 
 async def invoke(tenant: str, payload: dict[str, Any], request_id: str):
+    from slim_api.models.aws import InvokeAgentPayload
+    from slim_api.routers.las_agent import invoke_agent
+
     handler = Capture()
     root = logging.getLogger()
     root.addHandler(handler)
@@ -111,7 +109,23 @@ async def invoke(tenant: str, payload: dict[str, Any], request_id: str):
     return status, events, {"stdout": stdout.getvalue(), "stderr": stderr.getvalue(), "logs": handler.records}
 
 
+def assert_expected_result(events: list[Any], expected: Any, check: str) -> None:
+    if not isinstance(expected, str) or not expected.strip():
+        raise AssertionError(f"{check} needs a non-empty expected result")
+    result_values = [
+        event["result"]
+        for event in events
+        if isinstance(event, dict) and isinstance(event.get("result"), str)
+    ]
+    if expected not in "\n".join(result_values):
+        raise AssertionError(f"{check} missed its expected result in the caller result field")
+
+
 async def main():
+    from slim_api.models.aws import CreateAgentPayload
+    from slim_api.routers.las_agent import create_agent, delete_agent
+    from slim_api.util.las_client import get_las_client
+
     config = json.load(sys.stdin)
     cases = config.get("cases") if isinstance(config, dict) else None
     if not isinstance(cases, list) or not cases:
@@ -146,6 +160,9 @@ async def main():
             for call_index, call in enumerate(calls):
                 if not isinstance(call, dict) or not isinstance(call.get("task_prompt"), str):
                     raise ValueError("each call needs task_prompt")
+                expected = call.get("expected_text")
+                if not isinstance(expected, str) or not expected.strip():
+                    raise ValueError("each call needs a non-empty expected_text")
                 payload = {
                     "agent_id": assistant_id,
                     "session_id": session_id,
@@ -157,14 +174,11 @@ async def main():
                 status, events, captured = await invoke(
                     tenant, payload, f"aip5410-{token}-{case_index}-{call_index}"
                 )
-                serialized = json.dumps(events, sort_keys=True)
-                expected = call.get("expected_text")
                 if status < 200 or status >= 300 or any(
                     isinstance(event, dict) and event.get("success") is False for event in events
                 ):
                     raise AssertionError(f"case {case['name']} call {call_index} failed (HTTP {status})")
-                if not isinstance(expected, str) or expected not in serialized:
-                    raise AssertionError(f"case {case['name']} call {call_index} missed its expected result")
+                assert_expected_result(events, expected, f"case {case['name']} call {call_index}")
                 assert_absent(events, secrets, "caller response")
                 assert_absent(captured, secrets, "caller logs")
                 check_names.append(f"{case['name']}:call-{call_index + 1}")

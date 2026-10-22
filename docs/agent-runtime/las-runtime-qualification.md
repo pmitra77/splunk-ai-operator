@@ -95,10 +95,14 @@ the product graph in the final acceptance record.
 
 The deterministic fixture accepts `cpu_seconds` from 1 to 15 and burns CPU in
 the Agent Server worker. The scale command sends bounded concurrent synchronous
-runs while reading HPA and Deployment status with read-only `kubectl get`.
-It checks for current CPU metrics, queue scale-up from below max, the configured
+runs while reading HPA and Deployment status with read-only `kubectl get`. It
+confirms the HPA targets the named queue Deployment and that the starting
+replicas are ready, then keeps observing after requests finish until both the
+HPA count and ready worker count rise above their starting values or the
+scale-up timeout expires. It also checks for current CPU metrics, the configured
 replica cap, return to the minimum after the chart's 300-second stabilization
-window, ready worker floor, and an API Deployment configured for one replica.
+window, the ready worker floor, and an API Deployment configured for one
+replica.
 
 Example for an isolated disposable cluster:
 

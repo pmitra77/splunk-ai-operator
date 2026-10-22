@@ -276,8 +276,11 @@ def kubectl_json(namespace: str, resource: str, name: str):
 
 def hpa_observation(namespace: str, hpa_name: str, deployment_name: str):
     hpa = kubectl_json(namespace, "hpa", hpa_name)
-    deployment = kubectl_json(namespace, "deployment", deployment_name)
     spec = hpa.get("spec", {})
+    target = spec.get("scaleTargetRef", {})
+    if target.get("kind") != "Deployment" or target.get("name") != deployment_name:
+        raise AcceptanceError("HPA scale target does not match the supplied queue Deployment")
+    deployment = kubectl_json(namespace, "deployment", deployment_name)
     status = hpa.get("status", {})
     current_metrics = status.get("currentMetrics", [])
     cpu_metrics = [m for m in current_metrics if m.get("type") == "Resource" and m.get("resource", {}).get("name") == "cpu"]
@@ -289,6 +292,29 @@ def hpa_observation(namespace: str, hpa_name: str, deployment_name: str):
         "cpu_metrics_present": bool(cpu_metrics),
         "deployment_replicas": deployment.get("status", {}).get("readyReplicas", 0),
     }
+
+
+def wait_for_ready_scale_up(observe, futures, starting_replicas: int, starting_ready: int, timeout: int):
+    """Wait for both the HPA and ready worker count to rise, even after runs end."""
+    deadline = time.monotonic() + timeout
+    peak_hpa = starting_replicas
+    peak_ready = starting_ready
+    last = None
+    while time.monotonic() < deadline:
+        for future in futures:
+            if future.done():
+                future.result()
+        last = observe()
+        peak_hpa = max(peak_hpa, last["current"] or 0, last["desired"] or 0)
+        peak_ready = max(peak_ready, last["deployment_replicas"] or 0)
+        if all(future.done() for future in futures) and peak_hpa > starting_replicas and peak_ready > starting_ready:
+            return peak_hpa, peak_ready, last
+        time.sleep(min(5, max(0, deadline - time.monotonic())))
+    for future in futures:
+        if not future.done():
+            raise AcceptanceError("bounded LAS runs did not complete before scale-up timeout")
+        future.result()
+    raise AcceptanceError("queue HPA did not add a ready worker before scale-up timeout")
 
 
 def deployment_replicas(namespace: str, name: str):
@@ -313,8 +339,14 @@ def scale_command(args):
         raise AcceptanceError("LAS API Deployment is not configured for one replica")
     if before["max"] is None or before["max"] < before["min"]:
         raise AcceptanceError("HPA did not provide valid minimum and maximum bounds")
+    if before["current"] is not None and before["current"] >= before["max"]:
+        raise AcceptanceError("start below the HPA maximum to qualify scale-up")
     if not before["cpu_metrics_present"]:
         raise AcceptanceError("HPA has no current CPU metrics")
+    if before["current"] is None or before["deployment_replicas"] < before["current"]:
+        raise AcceptanceError("queue HPA baseline does not have all current replicas ready")
+    if before["deployment_replicas"] < before["min"]:
+        raise AcceptanceError("queue Deployment is below its ready worker floor before the test")
     if args.workers > before["max"] * 4:
         raise AcceptanceError("workload exceeds the bounded worker-to-HPA ratio")
 
@@ -324,22 +356,20 @@ def scale_command(args):
         case = {"name": name, "input": {"request": marker, "cpu_seconds": args.cpu_seconds}, "expected_state_values": [marker], "run_modes": ["sync"]}
         return run_protocol_case(client, args.graph_id, case, args.timeout)
 
-    peak = before["current"] or 0
-    last = before
-    deadline = time.monotonic() + args.timeout
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(execute, index) for index in range(args.workers)]
-        while time.monotonic() < deadline and not all(future.done() for future in futures):
-            last = hpa_observation(args.namespace, args.hpa, args.deployment)
-            peak = max(peak, last["current"] or 0, last["desired"] or 0)
-            time.sleep(5)
+        peak_hpa, peak_ready, last = wait_for_ready_scale_up(
+            lambda: hpa_observation(args.namespace, args.hpa, args.deployment),
+            futures,
+            before["current"],
+            before["deployment_replicas"],
+            args.timeout,
+        )
         for future in futures:
             future.result()
-    if before["current"] is None or before["current"] >= before["max"]:
-        raise AcceptanceError("start below the HPA maximum to qualify scale-up")
-    if peak <= before["current"]:
+    if peak_hpa <= before["current"]:
         raise AcceptanceError("queue HPA did not scale above its starting replica count")
-    if peak > last["max"]:
+    if peak_hpa > last["max"] or peak_ready > last["max"]:
         raise AcceptanceError("observed queue replicas exceeded the HPA maximum")
 
     downscale_deadline = time.monotonic() + args.downscale_timeout
@@ -359,7 +389,7 @@ def scale_command(args):
         raise AcceptanceError("queue HPA did not return to its minimum before downscale timeout")
     if last["deployment_replicas"] < last["min"]:
         raise AcceptanceError("queue Deployment did not restore its HPA minimum ready workers")
-    print(json.dumps({"result": "PASS", "check": "queue_scale_up_cap_downscale_floor_api_fixed", "workers": args.workers, "peak_replicas": peak, "hpa_min": last["min"], "hpa_max": last["max"], "ready_workers": last["deployment_replicas"], "api_replicas": api_now["desired"], "cpu_metrics_present": last["cpu_metrics_present"]}, sort_keys=True))
+    print(json.dumps({"result": "PASS", "check": "queue_scale_up_cap_downscale_floor_api_fixed", "workers": args.workers, "peak_replicas": peak_hpa, "peak_ready_workers": peak_ready, "hpa_min": last["min"], "hpa_max": last["max"], "ready_workers": last["deployment_replicas"], "api_replicas": api_now["desired"], "cpu_metrics_present": last["cpu_metrics_present"]}, sort_keys=True))
 
 
 def main():

@@ -90,7 +90,8 @@ measured. AIP-5411's runtime acceptance criteria therefore remain unproven.
 
 ## Local verification
 
-- `python3 tools/cluster_setup/test_las_runtime_acceptance.py`: **6 passed**.
+- `python3 tools/cluster_setup/test_las_runtime_acceptance.py`: **12 passed**
+  after the PR review regression cases were added.
 - `go test ./pkg/ai/features/agentruntime`: **not run to completion**; the Go
   toolchain download/check was blocked because this machine could not resolve
   `proxy.golang.org` (`lookup proxy.golang.org: no such host`).
@@ -102,4 +103,3 @@ measured. AIP-5411's runtime acceptance criteria therefore remain unproven.
 | AIP-5409 | Direct LAS sync, queued, SSE; graph-state persistence after API and queue restarts | Partial: caller-route probe remains outstanding |
 | AIP-5410 | Harness and missing product-input prerequisites recorded | Blocked: approved product graph and cases unavailable |
 | AIP-5411 | Static coverage and live HPA/PostgreSQL/Redis baseline recorded | Partial: controlled load, scale bounds/floor, and active-run recovery not demonstrated |
-

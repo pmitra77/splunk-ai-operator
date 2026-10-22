@@ -12,6 +12,12 @@ as safe context summaries; it never returns credential values or copies them
 into graph state. A message containing `AIP5402_INTERRUPT` triggers one
 interrupt so the SLIM route can be exercised again with a fresh resume context.
 
+For isolated queue-HPA qualification, set `cpu_seconds` to an integer from 1
+through 15 in the graph input. The fixture burns CPU inside the Agent Server
+worker for that bounded duration and persists the request marker in graph
+state. Omit the field for normal deterministic runs. Booleans, non-numeric
+values, and values outside 0 through 15 are rejected.
+
 The in-Pod caller-route acceptance probe is
 [`aip5402_slim_route_acceptance.py`](../../tools/cluster_setup/validation/aip5402_slim_route_acceptance.py).
 Run it only against an isolated SLIM candidate configured with

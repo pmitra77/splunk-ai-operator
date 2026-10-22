@@ -1,5 +1,6 @@
 """Deterministic Agent Server fixture for the LAS deployment contract."""
 
+from time import process_time
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -15,6 +16,7 @@ class FixtureState(TypedDict, total=False):
     context_keys: list[str]
     context_summary: dict[str, Any]
     pause: bool
+    cpu_seconds: float
 
 
 class FixtureContext(TypedDict, total=False):
@@ -37,6 +39,18 @@ def respond(state: FixtureState, runtime: Runtime[FixtureContext]) -> FixtureSta
     # path without introducing a model or an external tool dependency.
     if state.get("pause") or "AIP5402_INTERRUPT" in request:
         interrupt("Resume the fixture run with fresh context")
+
+    cpu_seconds = state.get("cpu_seconds", 0)
+    if isinstance(cpu_seconds, bool) or not isinstance(cpu_seconds, (int, float)):
+        raise ValueError("cpu_seconds must be a number")
+    if not 0 <= cpu_seconds <= 15:
+        raise ValueError("cpu_seconds must be between 0 and 15")
+    if cpu_seconds:
+        # Burn CPU in the Agent Server worker so HPA tests exercise its metric.
+        deadline = process_time() + cpu_seconds
+        value = 0
+        while process_time() < deadline:
+            value = (value * 33 + 17) % 65521
 
     context = runtime.context or {}
     allowed = ("llm_config", "mcp_configs", "kb_configs")

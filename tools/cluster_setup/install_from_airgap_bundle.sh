@@ -280,7 +280,8 @@ if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
     err "Bundled PyYAML package is missing or has an invalid filename"
   BUNDLED_SETUP="${BUNDLE_DIR}/cluster_setup"
   for required in k0s_cluster_with_stack.sh install_from_airgap_bundle.sh \
-                  artifacts.yaml splunk-operator-cluster.yaml las_deployment.py; do
+                  artifacts.yaml splunk-operator-cluster.yaml las_deployment.py \
+                  build_airgap_image_inventory.py; do
     [[ -s "${BUNDLED_SETUP}/${required}" ]] ||
       err "Version-matched installer artifact missing: cluster_setup/${required}"
   done
@@ -351,7 +352,11 @@ if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
         err "OCI archive images/${kind}-images.tar is missing image ${image_ref}"
     done < "${list}"
   done
-  log "CPU-only OCI archive and version-matched installer closure verified"
+  python3 "${BUNDLED_SETUP}/build_airgap_image_inventory.py" validate \
+    --inventory "${BUNDLE_DIR}/image-inventory.json" \
+    --bundle-dir "${BUNDLE_DIR}" ||
+    err "CPU-only image inventory is invalid or its staged LAS chart/image artifact is missing."
+  log "CPU-only OCI archive, image inventory, and version-matched installer closure verified"
 else
   [[ -n "${INSTALLER_SCRIPT}" ]] ||
     INSTALLER_SCRIPT="${SCRIPT_DIR}/k0s_cluster_with_stack.sh"

@@ -52,7 +52,7 @@ components:
   certManager: true
   monitoring: false
   otel: false
-  kuberay: false
+  kuberay: false # cpuOnly profile: keep this false. Do not change it to true or remove it (an omitted value defaults to true and is rejected).
   nvidia: false
   splunkOperator: true
   splunkStandalone: true

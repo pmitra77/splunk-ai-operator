@@ -317,7 +317,16 @@ air-gapped mode, and report every conflict at once:
 - `storage.modelStaging.enabled: false` (it defaults to `true` when omitted);
 - `aiPlatform.sidecars.envoy`, `otel` and `prometheusOperator` all `false` (they
   default from `components.otel` and `components.monitoring`);
-- `components.nvidia` and `components.kuberay` not set to `true`.
+- `aiPlatform.scaleFactor` omitted or `1` (it multiplies GPU capacity, which this
+  profile ignores);
+- `components.kuberay: false`, set explicitly (an omitted value defaults to
+  `true`, which would require Ray images and install the model-serving
+  operator);
+- `components.nvidia` not set to `true`.
+
+> **Do not change `components.kuberay: false` for the `cpuOnly` profile.** Leave
+> it set to `false` in every `cpuOnly` configuration. Removing it or setting it to
+> `true` is rejected by `validate` and `install`.
 
 ```yaml
 nodes:
@@ -325,6 +334,8 @@ nodes:
 storage:
   modelStaging:
     enabled: false
+components:
+  kuberay: false # cpuOnly: keep false, do not change
 aiPlatform:
   profile: cpuOnly
   sidecars:

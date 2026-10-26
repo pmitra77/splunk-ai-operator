@@ -345,8 +345,12 @@ aiPlatform:
         credentials:
           postgresUri: DO_NOT_PRINT_POSTGRES_CANARY
 YAML
+  # A mutation that silently fails would test a different config than intended.
   for expr in "$@"; do
-    yq eval -i "${expr}" "${path}"
+    yq eval -i "${expr}" "${path}" 2>/dev/null || {
+      FAIL=$(( FAIL + 1 ))
+      echo "  ❌ fixture error: yq could not apply: ${expr}"
+    }
   done
 }
 
@@ -374,8 +378,16 @@ _write_cpu_profile_config "${_profile_tmpdir}/valid-connected.yaml"
 _expect_profile_ok "cpuOnly with a consistent connected configuration" "${_profile_tmpdir}/valid-connected.yaml"
 _write_cpu_profile_config "${_profile_tmpdir}/valid-airgap.yaml" '.cluster.airgap = true'
 _expect_profile_ok "cpuOnly with a consistent air-gapped configuration" "${_profile_tmpdir}/valid-airgap.yaml"
-_write_cpu_profile_config "${_profile_tmpdir}/omitted-components.yaml" 'del(.components)'
-_expect_profile_ok "cpuOnly that omits components.nvidia and components.kuberay" "${_profile_tmpdir}/omitted-components.yaml"
+# The sample customers copy must keep passing; its controller list is blank by design.
+cp "${SCRIPT_DIR}/k0s-cluster-config-airgap-slim-las.yaml" "${_profile_tmpdir}/shipped-sample.yaml"
+yq eval -i '.nodes.existingIPs.controllers = ["10.0.0.1"]' "${_profile_tmpdir}/shipped-sample.yaml"
+_expect_profile_ok "the shipped air-gapped CPU-only sample config" "${_profile_tmpdir}/shipped-sample.yaml"
+_write_cpu_profile_config "${_profile_tmpdir}/nvidia-omitted.yaml" 'del(.components.nvidia)'
+_expect_profile_ok "cpuOnly that omits components.nvidia (never installed with zero GPU workers)" "${_profile_tmpdir}/nvidia-omitted.yaml"
+_write_cpu_profile_config "${_profile_tmpdir}/scalefactor-1.yaml" '.aiPlatform.scaleFactor = 1'
+_expect_profile_ok "cpuOnly with aiPlatform.scaleFactor: 1" "${_profile_tmpdir}/scalefactor-1.yaml"
+_write_cpu_profile_config "${_profile_tmpdir}/scalefactor-text.yaml" '.aiPlatform.scaleFactor = "two"'
+_expect_profile_ok "cpuOnly with a non-numeric scaleFactor (left to validate_scale_factor_config)" "${_profile_tmpdir}/scalefactor-text.yaml"
 
 # Full-feature selection is untouched: GPU, SAIA, staging, and sidecar settings
 # that cpuOnly forbids must still pass when the profile is omitted or full.
@@ -384,6 +396,7 @@ _full_overrides=(
   '.aiPlatform.defaultAcceleratorType = "L40S"'
   '.components.nvidia = true'
   '.components.kuberay = true'
+  '.aiPlatform.scaleFactor = 3'
   'del(.storage.modelStaging)'
   '.aiPlatform.sidecars.otel = true'
   '.aiPlatform.features = [{"name":"saia"},{"name":"slim"}]'
@@ -424,7 +437,22 @@ _expect_profile_conflict "cpuOnly with an accelerator type" "${_profile_tmpdir}/
 _write_cpu_profile_config "${_profile_tmpdir}/nvidia.yaml" '.components.nvidia = true'
 _expect_profile_conflict "cpuOnly with components.nvidia: true" "${_profile_tmpdir}/nvidia.yaml" "components.nvidia: true"
 _write_cpu_profile_config "${_profile_tmpdir}/kuberay.yaml" '.components.kuberay = true'
-_expect_profile_conflict "cpuOnly with components.kuberay: true" "${_profile_tmpdir}/kuberay.yaml" "components.kuberay: true"
+_expect_profile_conflict "cpuOnly with components.kuberay: true" "${_profile_tmpdir}/kuberay.yaml" "components.kuberay must be explicitly false for cpuOnly (resolved: true"
+_write_cpu_profile_config "${_profile_tmpdir}/kuberay-omitted.yaml" 'del(.components.kuberay)'
+_expect_profile_conflict "cpuOnly with components.kuberay omitted (resolves to true)" "${_profile_tmpdir}/kuberay-omitted.yaml" "components.kuberay must be explicitly false for cpuOnly (resolved: true"
+_write_cpu_profile_config "${_profile_tmpdir}/components-omitted.yaml" 'del(.components)'
+_expect_profile_conflict "cpuOnly with the whole components block omitted" "${_profile_tmpdir}/components-omitted.yaml" "components.kuberay must be explicitly false"
+_write_cpu_profile_config "${_profile_tmpdir}/kuberay-guidance.yaml" 'del(.components.kuberay)'
+_expect_profile_conflict "kuberay conflict tells customers not to change components.kuberay: false" "${_profile_tmpdir}/kuberay-guidance.yaml" "do not change it for the cpuOnly profile"
+_write_cpu_profile_config "${_profile_tmpdir}/scalefactor-2.yaml" '.aiPlatform.scaleFactor = 2'
+_expect_profile_conflict "cpuOnly with aiPlatform.scaleFactor: 2" "${_profile_tmpdir}/scalefactor-2.yaml" "aiPlatform.scaleFactor must be 1 or omitted for cpuOnly"
+_write_cpu_profile_config "${_profile_tmpdir}/scalefactor-int64.yaml" '.aiPlatform.scaleFactor = 9223372036854775807'
+_expect_profile_conflict "cpuOnly with the largest int64 scaleFactor (no arithmetic overflow)" "${_profile_tmpdir}/scalefactor-int64.yaml" "aiPlatform.scaleFactor must be 1 or omitted for cpuOnly"
+# yq cannot assign a value beyond int64, so write the literal into the file directly.
+_write_cpu_profile_config "${_profile_tmpdir}/scalefactor-huge.yaml" '.aiPlatform.scaleFactor = "99999999999999999999"'
+sed 's/"99999999999999999999"/99999999999999999999/' "${_profile_tmpdir}/scalefactor-huge.yaml" > "${_profile_tmpdir}/scalefactor-huge.new" && mv "${_profile_tmpdir}/scalefactor-huge.new" "${_profile_tmpdir}/scalefactor-huge.yaml"
+assert_eq "fixture holds an unquoted beyond-int64 scaleFactor" "99999999999999999999" "$(grep -E '^  scaleFactor:' "${_profile_tmpdir}/scalefactor-huge.yaml" | awk '{print $2}')"
+_expect_profile_conflict "cpuOnly with a scaleFactor beyond int64" "${_profile_tmpdir}/scalefactor-huge.yaml" "aiPlatform.scaleFactor must be 1 or omitted for cpuOnly"
 _write_cpu_profile_config "${_profile_tmpdir}/staging-true.yaml" '.storage.modelStaging.enabled = true'
 _expect_profile_conflict "cpuOnly with model staging enabled" "${_profile_tmpdir}/staging-true.yaml" "storage.modelStaging.enabled must be false"
 _write_cpu_profile_config "${_profile_tmpdir}/staging-omitted.yaml" 'del(.storage.modelStaging)'

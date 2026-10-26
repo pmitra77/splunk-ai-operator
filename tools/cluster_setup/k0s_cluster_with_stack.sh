@@ -928,13 +928,26 @@ validate_cpu_profile_consistency() {
   if [[ -n "${DEFAULT_ACCELERATOR:-}" ]]; then
     conflicts+=("aiPlatform.defaultAcceleratorType must be empty for cpuOnly")
   fi
-  # Omitted components are tolerated: nvidia is never installed with zero GPU
-  # workers. Only an explicit true contradicts the profile.
+  # aiPlatform.scaleFactor multiplies GPU capacity, and the installer drops it
+  # for cpuOnly, so a value above 1 would be silently ignored. The AIPlatform
+  # webhook rejects it too. Non-numeric values are reported by
+  # validate_scale_factor_config.
+  local scale_factor
+  scale_factor="$(yq eval '.aiPlatform.scaleFactor // ""' "${CONFIG_FILE}" 2>/dev/null || echo "")"
+  if [[ "${scale_factor}" =~ ^[0-9]+$ ]] && { (( ${#scale_factor} > 9 )) || (( 10#${scale_factor} > 1 )); }; then
+    conflicts+=("aiPlatform.scaleFactor must be 1 or omitted for cpuOnly; it multiplies GPU capacity and is ignored by this profile")
+  fi
+  # Omitted components: nvidia is never installed with zero GPU workers, so only
+  # an explicit true contradicts the profile.
   if [[ "$(config_bool '.components.nvidia' 'false')" == "true" ]]; then
     conflicts+=("components.nvidia: true installs GPU support, which cpuOnly does not use; set it to false")
   fi
-  if [[ "$(config_bool '.components.kuberay' 'false')" == "true" ]]; then
-    conflicts+=("components.kuberay: true installs the model-serving operator, which cpuOnly does not use; set it to false")
+  # KubeRay is different: an omitted value resolves to true, which makes
+  # validate_image_config demand Ray images and the install deploy the
+  # model-serving operator. cpuOnly therefore needs an explicit false. Do not
+  # change components.kuberay from false for the cpuOnly profile.
+  if [[ "${COMPONENT_KUBERAY:-true}" != "false" ]]; then
+    conflicts+=("components.kuberay must be explicitly false for cpuOnly (resolved: ${COMPONENT_KUBERAY:-true}, an omitted value defaults to true); set components.kuberay: false and do not change it for the cpuOnly profile")
   fi
   # An omitted value defaults to true, which would stage model artifacts with
   # no accelerator, so cpuOnly must disable staging explicitly.

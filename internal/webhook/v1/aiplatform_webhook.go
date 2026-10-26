@@ -215,6 +215,12 @@ func (v *AIPlatformCustomValidator) ValidateUpdate(ctx context.Context, oldObj, 
 		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec").Child("profile"),
 			"switching an existing model-serving AIPlatform to cpuOnly is not supported"))
 	}
+	// The reverse would start Ray, the vector database and ingress beside the
+	// running Launchpad workloads, leaving a half-converted platform.
+	if oldPlatform.Spec.Profile == aiv1.AIPlatformProfileCPUOnly && aiplatform.Spec.Profile != aiv1.AIPlatformProfileCPUOnly {
+		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec").Child("profile"),
+			"switching an existing cpuOnly AIPlatform to full is not supported"))
+	}
 
 	if len(allErrs) > 0 {
 		return warnings, allErrs.ToAggregate()

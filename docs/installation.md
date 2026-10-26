@@ -352,6 +352,14 @@ The AIPlatform admission webhook rejects the same combinations, but only when th
 resource is applied, after the cluster and Secrets exist. Switching an existing
 full-feature AIPlatform to `cpuOnly` is not supported.
 
+The reverse is rejected too: switching an existing `cpuOnly` AIPlatform to `full`,
+including by removing `aiPlatform.profile`, fails with an error on `spec.profile`,
+so a deployment is never left half-converted. To change profile, delete the
+AIPlatform and install again with the other profile. The admission webhook
+(`webhook.enabled: true`, the default) enforces both directions. Without the
+webhook the operator still refuses a `cpuOnly` AIPlatform that has already run
+model serving, but it cannot detect a `cpuOnly` to `full` change.
+
 ---
 
 ## LAS deployment mode, credentials, and egress

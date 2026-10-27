@@ -479,12 +479,17 @@ func (r *AIPlatformReconciler) CheckAIServiceStatus(ctx context.Context, platfor
 				}
 				return fmt.Errorf("AIService %s LAS Ready condition is %s for generation %d (observed generation %d, reason %s): %s", child.Name, ready.Status, child.Generation, ready.ObservedGeneration, ready.Reason, ready.Message)
 			}
-		} else if platform.Spec.Profile == aiApi.AIPlatformProfileCPUOnly && child.Spec.Feature.Name == "slim" {
-			// SLIM is part of the CPU-only caller route. Its feature reconciler
+		} else if child.Spec.Feature.Name == "slim" {
+			// SLIM Ready already waits for the dependencies of the platform's
+			// profile (AgentRuntime, plus model serving for full), so the
+			// platform follows it in both profiles. Its feature reconciler
 			// writes the resource's observed generation but does not populate
 			// ObservedGeneration on individual conditions.
 			ready := meta.FindStatusCondition(child.Status.Conditions, "Ready")
 			if child.Status.ObservedGeneration < child.Generation || ready == nil || ready.Status != metav1.ConditionTrue {
+				if ready != nil && ready.Status != metav1.ConditionTrue {
+					return fmt.Errorf("AIService %s SLIM is not ready for generation %d (reason %s): %s", child.Name, child.Generation, ready.Reason, ready.Message)
+				}
 				return fmt.Errorf("AIService %s SLIM is not ready for generation %d", child.Name, child.Generation)
 			}
 		}

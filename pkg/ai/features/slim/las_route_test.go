@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	aiv1 "github.com/splunk/splunk-ai-operator/api/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -224,7 +225,10 @@ func TestValidateAIService_CPUOnlyRouteDoesNotRequireRay(t *testing.T) {
 	scheme := buildTestScheme(t)
 	platform := &aiv1.AIPlatform{
 		ObjectMeta: metav1.ObjectMeta{Name: "cpu-platform", Namespace: "ai-platform"},
-		Spec:       aiv1.AIPlatformSpec{Features: []aiv1.FeatureSpec{{Name: "agentruntime", Provider: "mltk"}}},
+		Spec: aiv1.AIPlatformSpec{
+			Profile:  aiv1.AIPlatformProfileCPUOnly,
+			Features: []aiv1.FeatureSpec{{Name: "agentruntime", Provider: "mltk"}},
+		},
 	}
 	ai := &aiv1.AIService{
 		ObjectMeta: metav1.ObjectMeta{Name: "cpu-platform-slim", Namespace: "ai-platform"},
@@ -237,8 +241,9 @@ func TestValidateAIService_CPUOnlyRouteDoesNotRequireRay(t *testing.T) {
 	require.NoError(t, r.validateAIService(context.Background(), ai))
 }
 
-func TestValidateAIService_FullProfileStillRequiresRay(t *testing.T) {
+func TestValidateAIService_FullProfileHoldsTheWorkloadUntilModelServingIsReady(t *testing.T) {
 	scheme := buildTestScheme(t)
+	require.NoError(t, rayv1.AddToScheme(scheme))
 	platform := &aiv1.AIPlatform{
 		ObjectMeta: metav1.ObjectMeta{Name: "full-platform", Namespace: "ai-platform"},
 		Spec: aiv1.AIPlatformSpec{Features: []aiv1.FeatureSpec{
@@ -253,7 +258,11 @@ func TestValidateAIService_FullProfileStillRequiresRay(t *testing.T) {
 	r := &SlimReconciler{Client: fakeClient, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
 	t.Setenv("RELATED_IMAGE_SLIM_API", "slim:test")
 
-	require.ErrorContains(t, r.validateAIService(context.Background(), ai), "RayService is not ready")
+	err := r.validateAIService(context.Background(), ai)
+	var held *dependencyPendingError
+	require.ErrorAs(t, err, &held, "an unready dependency holds the workload; it is not a reconcile failure")
+	assert.Equal(t, dependencyModelServing, held.state.dependency)
+	assert.Contains(t, held.state.message, "does not exist")
 }
 
 func TestSlimConfigMapEnforcesProductionCallerAuthentication(t *testing.T) {

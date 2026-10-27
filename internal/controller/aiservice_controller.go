@@ -53,6 +53,8 @@ import (
 
 const aiServiceFinalizer = "ai.splunk.com/aiservice-protect"
 
+const slimDependencyPollInterval = 15 * time.Second
+
 // AIServiceReconciler reconciles a AIService object
 type AIServiceReconciler struct {
 	client.Client
@@ -216,6 +218,11 @@ func (r *AIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	telemetry.ObserveReconcileResult(ctx, "success")
 	if featureName == "agentruntime" {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if featureName == "slim" {
+		// SLIM readiness follows its LAS and model-serving dependencies, whose
+		// status-only changes the event filter drops, so poll them.
+		return ctrl.Result{RequeueAfter: slimDependencyPollInterval}, nil
 	}
 	return ctrl.Result{}, nil
 }

@@ -3,6 +3,7 @@ package slim
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -48,12 +50,34 @@ const (
 func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIService) error {
 	log := log.FromContext(ctx)
 
+	previous := append([]metav1.Condition(nil), aiservice.Status.Conditions...)
 	var conditions []metav1.Condition
+	// Events are emitted only once the status that justifies them is stored, so
+	// a failed write does not repeat them on every poll.
+	var emitEvents func()
 	defer func() {
 		aiservice.Status.Conditions = conditions
 		aiservice.Status.ObservedGeneration = aiservice.Generation
-		_ = r.Status().Update(ctx, aiservice)
+		if err := r.Status().Update(ctx, aiservice); err == nil && emitEvents != nil {
+			emitEvents()
+		}
 	}()
+
+	// The periodic requeue re-runs this method, so a condition keeps its
+	// LastTransitionTime until its status really changes.
+	newCondition := func(condType string, status metav1.ConditionStatus, reason, message string) metav1.Condition {
+		cond := metav1.Condition{
+			Type:               condType,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		}
+		if old := meta.FindStatusCondition(previous, condType); old != nil && old.Status == status {
+			cond.LastTransitionTime = old.LastTransitionTime
+		}
+		return cond
+	}
 
 	stages := []struct {
 		name string
@@ -71,37 +95,76 @@ func (r *SlimReconciler) Reconcile(ctx context.Context, aiservice *aiv1.AIServic
 		{"SlimDeploymentAvailable", r.checkSlimDeploymentAvailable},
 	}
 
+	var held *dependencyPendingError
 	for _, stage := range stages {
 		err := stage.fn(ctx, aiservice)
+		if errors.As(err, &held) {
+			// A dependency the workload cannot be configured without is not
+			// ready yet. Hold the workload and report the dependency below; this
+			// is not a failure, so it must not back off.
+			break
+		}
 
-		cond := metav1.Condition{
-			Type:               stage.name + "Ready",
-			Status:             metav1.ConditionTrue,
-			Reason:             "Reconciled",
-			Message:            "stage succeeded",
-			LastTransitionTime: metav1.Now(),
-		}
+		status, reason, message := metav1.ConditionTrue, "Reconciled", "stage succeeded"
 		if err != nil {
-			cond.Status = metav1.ConditionFalse
-			cond.Reason = "Error"
-			cond.Message = err.Error()
+			status, reason, message = metav1.ConditionFalse, "Error", err.Error()
 		}
-		conditions = append(conditions, cond)
+		conditions = append(conditions, newCondition(stage.name+"Ready", status, reason, message))
 		if err != nil {
 			log.Error(err, "stage failed", "stage", stage.name)
 			return err
 		}
 	}
 
-	conditions = append(conditions, metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		Reason:             "AllReconciled",
-		Message:            "all stages completed successfully",
-		LastTransitionTime: metav1.Now(),
-	})
+	states, err := r.dependencyStates(ctx, aiservice)
+	if err != nil {
+		// A lookup failure says nothing about the dependencies, so the last
+		// known readiness is kept rather than flipping SLIM and waking the platform.
+		log.Error(err, "evaluating SLIM dependencies failed")
+		for _, cond := range previous {
+			if cond.Type == "Ready" || cond.Type == dependencyAgentRuntime+"Ready" || cond.Type == dependencyModelServing+"Ready" {
+				conditions = append(conditions, cond)
+			}
+		}
+		return err
+	}
+	if held != nil {
+		states = withHeldDependency(states, held)
+	}
+
+	var blocked []string
+	for _, state := range states {
+		status, reason, message := metav1.ConditionTrue, "Reconciled", state.dependency+" is ready"
+		if !state.ready {
+			status, reason, message = metav1.ConditionFalse, reasonDependencyNotReady, state.message
+			blocked = append(blocked, state.dependency+": "+state.message)
+		}
+		conditions = append(conditions, newCondition(state.dependency+"Ready", status, reason, message))
+	}
+
+	ready := newCondition("Ready", metav1.ConditionTrue, "AllReconciled", "all stages completed successfully")
+	if len(blocked) > 0 {
+		ready = newCondition("Ready", metav1.ConditionFalse, reasonDependencyNotReady, "blocked by "+strings.Join(blocked, "; "))
+	}
+	conditions = append(conditions, ready)
+	previousReady := meta.FindStatusCondition(previous, "Ready")
+	emitEvents = func() { r.recordReadyTransition(aiservice, previousReady, ready) }
 
 	return nil
+}
+
+// recordReadyTransition emits an Event when SLIM becomes blocked, is blocked by
+// a different dependency, or recovers.
+func (r *SlimReconciler) recordReadyTransition(ai *aiv1.AIService, previous *metav1.Condition, current metav1.Condition) {
+	if r.Recorder == nil {
+		return
+	}
+	switch {
+	case current.Status == metav1.ConditionFalse && (previous == nil || previous.Status != metav1.ConditionFalse || previous.Message != current.Message):
+		r.Recorder.Event(ai, corev1.EventTypeWarning, reasonDependencyNotReady, current.Message)
+	case current.Status == metav1.ConditionTrue && previous != nil && previous.Status == metav1.ConditionFalse:
+		r.Recorder.Event(ai, corev1.EventTypeNormal, "DependenciesReady", "SLIM dependencies are ready")
+	}
 }
 
 func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIService) error {
@@ -122,14 +185,30 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 		r.Recorder.Event(ai, corev1.EventTypeWarning, "InvalidSpec", "fetching AIPlatform failed")
 		return fmt.Errorf("fetching AIPlatform: %w", err)
 	}
-	// Full-feature profiles include SAIA/model serving. CPU-only profiles omit
-	// it, so SLIM's route to LAS must not depend on a Ray endpoint in that mode.
-	// AIP-5576 owns the complete profile-aware readiness contract.
-	if platformHasFeature(aiPlatform, "saia") {
-		if err := r.validateAIPlatformReady(ctx, aiPlatform); err != nil {
-			return fmt.Errorf("AIPlatform model-serving infrastructure not ready: %w", err)
+	// A CPU-only platform has no model serving: nothing below this guard runs
+	// for it, so SLIM never reads Ray state or needs a model endpoint there.
+	if aiPlatform.Spec.Profile != aiv1.AIPlatformProfileCPUOnly {
+		saia := platformHasFeature(aiPlatform, "saia")
+		// A SLIM workload that does not exist yet, or whose model URL cannot be
+		// derived from the Ray service, is held (not failed) until model
+		// serving is ready, so its first pods do not start against an endpoint
+		// that is not serving. An existing workload keeps reconciling through a
+		// Ray outage; readiness is reported by the dependency gates.
+		state, err := r.modelServingState(ctx, aiPlatform)
+		if err != nil {
+			return fmt.Errorf("checking model serving: %w", err)
 		}
-		if ai.Spec.AIPlatformUrl == "" {
+		if !state.ready {
+			urlUnknown := saia && ai.Spec.AIPlatformUrl == "" && aiPlatform.Status.RayServiceName == ""
+			exists, err := r.slimDeploymentExists(ctx, ai)
+			if err != nil {
+				return err
+			}
+			if urlUnknown || !exists {
+				return &dependencyPendingError{state: state}
+			}
+		}
+		if saia && ai.Spec.AIPlatformUrl == "" {
 			clusterDomain := ai.Spec.ClusterDomain
 			if clusterDomain == "" {
 				clusterDomain = "cluster.local"
@@ -166,6 +245,17 @@ func (r *SlimReconciler) validateAIService(ctx context.Context, ai *aiv1.AIServi
 	return nil
 }
 
+func (r *SlimReconciler) slimDeploymentExists(ctx context.Context, ai *aiv1.AIService) (bool, error) {
+	err := r.Get(ctx, types.NamespacedName{Name: ai.Name + "-slim-deployment", Namespace: ai.Namespace}, &appsv1.Deployment{})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("observe SLIM Deployment: %w", err)
+	}
+	return true, nil
+}
+
 func (r *SlimReconciler) getAIPlatform(ctx context.Context, ref corev1.ObjectReference) (*aiv1.AIPlatform, error) {
 	var aiPlatform aiv1.AIPlatform
 	key := types.NamespacedName{
@@ -176,16 +266,6 @@ func (r *SlimReconciler) getAIPlatform(ctx context.Context, ref corev1.ObjectRef
 		return nil, err
 	}
 	return &aiPlatform, nil
-}
-
-func (r *SlimReconciler) validateAIPlatformReady(ctx context.Context, aiPlatform *aiv1.AIPlatform) error {
-	if !common.IsConditionTrue(aiPlatform.Status.Conditions, "RayServiceStatusReady") {
-		return fmt.Errorf("RayService is not ready")
-	}
-	if aiPlatform.Status.RayServiceName == "" {
-		return fmt.Errorf("RayServiceName not populated in AIPlatform status")
-	}
-	return nil
 }
 
 func platformHasFeature(platform *aiv1.AIPlatform, name string) bool {

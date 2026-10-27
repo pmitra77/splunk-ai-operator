@@ -362,6 +362,38 @@ AIPlatform and install again with the other profile. The admission webhook
 webhook the operator still refuses a `cpuOnly` AIPlatform that has already run
 model serving, but it cannot detect a `cpuOnly` to `full` change.
 
+### SLIM readiness follows the profile
+
+The SLIM `AIService` is `Ready` only when the dependencies of its profile are:
+
+| Profile | SLIM waits for |
+| --- | --- |
+| `cpuOnly` | AgentRuntime (LAS) `Ready`. It never waits for model serving, which a `cpuOnly` platform does not have. |
+| `full` (or omitted) | AgentRuntime `Ready` **and** model serving (the `RayService`) ready. |
+
+When a dependency is not ready SLIM publishes `Ready=False` with reason
+`DependencyNotReady`, and a message such as
+`blocked by AgentRuntime: AIService <name> Ready is False (reason <reason>)`.
+Each dependency also has its own condition, `AgentRuntimeReady` and, for `full`,
+`ModelServingReady`, and a Warning Event is recorded when SLIM becomes blocked
+and a Normal Event when it recovers. Messages carry resource names and condition
+reasons only, never credentials or the dependency's own free-text message; read
+the named resource for detail.
+
+```bash
+kubectl get aiservice <platform>-slim -n <namespace> \
+  -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
+```
+
+SLIM re-checks its dependencies every 15 seconds, so losing a dependency makes
+SLIM unready, and restoring it makes SLIM `Ready` again, without a restart. The
+`AIPlatform` reports a blocked SLIM in its `AIServiceStatusReady` condition for
+both profiles. In `full`, the SLIM workload is not first created until model
+serving is ready, so its first pods never start against an endpoint that is not
+serving; once it exists it keeps reconciling through a Ray outage and only its
+readiness changes. A `cpuOnly` platform never reads Ray state, needs no model
+endpoint, and works on a cluster without the KubeRay CRDs.
+
 ---
 
 ## LAS deployment mode, credentials, and egress

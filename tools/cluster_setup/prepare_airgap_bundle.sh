@@ -33,6 +33,7 @@ GPU_NODE_OS="${GPU_NODE_OS:-rhel9}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle}"
 CLUSTER_CONFIG=""
+MIRROR_REGISTRY="${MIRROR_REGISTRY:-}"
 CPU_ONLY_BUNDLE=false
 LOCAL_PATH_HELPER_IMAGE="docker.io/library/busybox:1.36.1"
 
@@ -41,6 +42,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir)  OUTPUT_DIR="$2"; shift 2 ;;
     --config)      CLUSTER_CONFIG="$2"; shift 2 ;;
+    --mirror-registry) MIRROR_REGISTRY="$2"; shift 2 ;;
     --k0s-version) K0S_VERSION="$2"; shift 2 ;;
     --gpu-os)      GPU_NODE_OS="$2"; shift 2 ;;
     -h|--help)
@@ -61,6 +63,10 @@ OPTIONS
                         installer sources. Omit full-profile charts/GPU files.
                         Requires --k0s-version and PYYAML_VERSION to pin
                         the remaining downloaded artifacts.
+
+  --mirror-registry HOST
+                        Optional internal registry prefix recorded in the
+                        generated image inventory.
 
   --k0s-version VER     Specific k0s release to download (e.g. v1.31.2+k0s.0).
                         Default: latest stable release
@@ -240,6 +246,8 @@ require_cmd curl
 require_cmd helm
 require_cmd tar
 if [[ -n "${CLUSTER_CONFIG}" ]]; then
+  require_cmd skopeo
+  require_cmd python3
   [[ "${K0S_VERSION}" != "latest" && -n "${PYYAML_VERSION}" ]] ||
     err "CPU-only bundle requires --k0s-version and PYYAML_VERSION"
 fi
@@ -485,6 +493,22 @@ if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
     verify_oci_bundle_refs "${STAGE_DIR}/images/${kind}-images.tar" \
                            "${STAGE_DIR}/images/${kind}-images.list"
   done
+
+  EMBEDDED_LAS_CHART="${SCRIPT_DIR}/../../pkg/ai/features/agentruntime/chart/langgraph-cloud-0.3.5-splunk.2.tgz"
+  [[ -s "${EMBEDDED_LAS_CHART}" ]] || err "Embedded LAS chart archive is missing: ${EMBEDDED_LAS_CHART}"
+  cp "${EMBEDDED_LAS_CHART}" "${STAGE_DIR}/charts/"
+  INVENTORY_IMAGES="${STAGE_DIR}/ai-tier-images.list"
+  cat "${STAGE_DIR}/images/k0s-images.list" \
+      "${STAGE_DIR}/images/addon-images.list" \
+      "${STAGE_DIR}/images/workload-images.list" | sort -u > "${INVENTORY_IMAGES}"
+  python3 "${SCRIPT_DIR}/build_airgap_image_inventory.py" build \
+    --images-file "${INVENTORY_IMAGES}" \
+    --image-lists-dir "${STAGE_DIR}/images" \
+    --profile cpuOnly \
+    --mirror-registry "${MIRROR_REGISTRY}" \
+    --embedded-chart "${STAGE_DIR}/charts/$(basename "${EMBEDDED_LAS_CHART}")" \
+    --output "${STAGE_DIR}/image-inventory.json" \
+    || err "Could not resolve every bundled image digest/platform. Check registry access and auth."
 fi
 
 # ── 5. GPU node OS packages ───────────────────────────────────────────────────
@@ -695,7 +719,8 @@ if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
   # revision as the image list. The private installer must use these copies.
   mkdir -p "${STAGE_DIR}/cluster_setup"
   for source_file in k0s_cluster_with_stack.sh install_from_airgap_bundle.sh \
-                     artifacts.yaml splunk-operator-cluster.yaml las_deployment.py; do
+                     artifacts.yaml splunk-operator-cluster.yaml las_deployment.py \
+                     build_airgap_image_inventory.py; do
     [[ -s "${SCRIPT_DIR}/${source_file}" ]] || err "Missing installer source: ${source_file}"
     cp "${SCRIPT_DIR}/${source_file}" "${STAGE_DIR}/cluster_setup/${source_file}"
   done

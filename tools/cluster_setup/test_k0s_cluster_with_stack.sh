@@ -114,6 +114,82 @@ _load_functions() {
 
 _load_functions
 
+# Tests: Splunk Standalone is discovered before readiness is awaited
+suite "wait_for_splunk_standalone"
+echo "- wait_for_splunk_standalone"
+eval "$(_extract_fn wait_for_splunk_standalone)"
+
+_standalone_pod_appears_then_ready() (
+  local state call_count argument timeout_seconds
+  state="$(mktemp -d)"
+  trap 'rm -rf "${state}"' EXIT
+  printf '0\n' > "${state}/get-count"
+  SPLUNK_MODE=internal
+  AI_STANDALONE_NAME=splunk-standalone
+  AI_NS=ai
+  SPLUNK_STANDALONE_READY_TIMEOUT_SECONDS=10
+  kubectl() {
+    case "$1" in
+      get)
+        [[ "$*" == "get pods -n ai -l app.kubernetes.io/instance=splunk-splunk-standalone-standalone -o name" ]] || return 2
+        call_count="$(cat "${state}/get-count")"
+        call_count=$((call_count + 1))
+        printf '%s\n' "${call_count}" > "${state}/get-count"
+        if (( call_count >= 2 )); then
+          printf '%s\n' "pod/splunk-splunk-standalone-standalone-0"
+        fi
+        return 0
+        ;;
+      wait)
+        [[ "$*" == "wait --for=condition=Ready pod -l app.kubernetes.io/instance=splunk-splunk-standalone-standalone -n ai --timeout="*s ]] || return 2
+        for argument in "$@"; do :; done
+        timeout_seconds="${argument#--timeout=}"
+        timeout_seconds="${timeout_seconds%s}"
+        [[ "${timeout_seconds}" =~ ^[0-9]+$ ]] && (( timeout_seconds > 0 && timeout_seconds < 10 )) || return 2
+        printf '%s\n' "$*" > "${state}/wait-args"
+        ;;
+      *) return 2 ;;
+    esac
+  }
+  sleep() { SECONDS=$((SECONDS + $1)); }
+  wait_for_splunk_standalone || return 1
+  [[ "$(cat "${state}/get-count")" == "2" && -s "${state}/wait-args" ]]
+)
+
+assert_rc "retries until the selected pod exists, then waits for Ready" 0 \
+  _standalone_pod_appears_then_ready
+
+_standalone_missing_pod_expires() (
+  local state call_count rc=0
+  state="$(mktemp -d)"
+  trap 'rm -rf "${state}"' EXIT
+  printf '0\n' > "${state}/get-count"
+  SPLUNK_MODE=internal
+  AI_STANDALONE_NAME=splunk-standalone
+  AI_NS=ai
+  SPLUNK_STANDALONE_READY_TIMEOUT_SECONDS=11
+  kubectl() {
+    case "$1" in
+      get)
+        call_count="$(cat "${state}/get-count")"
+        printf '%s\n' "$((call_count + 1))" > "${state}/get-count"
+        return 0
+        ;;
+      *) touch "${state}/unexpected-wait"; return 2 ;;
+    esac
+  }
+  sleep() { SECONDS=$((SECONDS + $1)); }
+  airgap_cpu_profile_selected() { return 0; }
+  err() { return 1; }
+  wait_for_splunk_standalone || rc=$?
+  [[ "${rc}" == "1" && "$(cat "${state}/get-count")" -ge 2 &&
+     ! -e "${state}/unexpected-wait" ]]
+)
+
+assert_rc "expires after a bounded retry when no selected pod appears" 0 \
+  _standalone_missing_pod_expires
+
+
 # ── Tests: effective network mode is independent of platform profile ────────
 suite "resolve_airgap_mode"
 echo "▶ resolve_airgap_mode"
@@ -1312,6 +1388,19 @@ assert_eq "allows only one automatic NVIDIA recovery reboot" \
 
 assert_eq "waits for the node to return after the recovery reboot" \
   "1" "$(grep -c 'did not return after the NVIDIA recovery reboot' "${SCRIPT}" | tr -d '[:space:]')"
+
+# Tests: worker token files must be private from creation
+suite "worker token permissions"
+echo "Worker token permissions"
+_worker_join_commands="$(grep -F 'sudo k0s install worker --token-file=/tmp/k0s-token' "${SCRIPT}" || true)"
+assert_eq "initial install and join-workers both write a token" "2" \
+  "$(printf '%s\n' "${_worker_join_commands}" | grep -c 'sudo k0s install worker --token-file=/tmp/k0s-token' || true)"
+assert_eq "both paths preserve token bytes with printf" "2" \
+  "$(printf '%s\n' "${_worker_join_commands}" | grep -Fc "printf '%s\\n' " || true)"
+assert_eq "both paths create a mode-0600 token file" "2" \
+  "$(printf '%s\n' "${_worker_join_commands}" | grep -Fc 'sudo install -m 600 /dev/stdin /tmp/k0s-token' || true)"
+assert_eq "neither path uses tee's permissive default mode" "0" \
+  "$(printf '%s\n' "${_worker_join_commands}" | grep -Fc 'sudo tee /tmp/k0s-token' || true)"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 

@@ -2405,8 +2405,8 @@ PYSCRIPT"
       sudo systemctl daemon-reload
     " 2>/dev/null || true
 
-    # Write token to temp file first (stdin pipe doesn't work reliably over SSH)
-    if ssh_exec "${worker_ip}" "echo '${worker_token}' | sudo tee /tmp/k0s-token >/dev/null && sudo k0s install worker --token-file=/tmp/k0s-token"; then
+    # Create the token file as root with mode 0600 before k0s reads it.
+    if ssh_exec "${worker_ip}" "printf '%s\n' '${worker_token}' | sudo install -m 600 /dev/stdin /tmp/k0s-token && sudo k0s install worker --token-file=/tmp/k0s-token"; then
       log "  ✓ k0s installed on ${worker_ip}"
       # Air-gap: stage k0s system images now — after install (recreated
       # /var/lib/k0s), before this worker is started in the loop below.
@@ -5069,10 +5069,34 @@ wait_for_splunk_standalone() {
     return 0
   fi
 
+  local timeout="${SPLUNK_STANDALONE_READY_TIMEOUT_SECONDS:-600}"
+  [[ "${timeout}" =~ ^[1-9][0-9]*$ ]] ||
+    err "SPLUNK_STANDALONE_READY_TIMEOUT_SECONDS must be a positive integer"
+  local deadline=$((SECONDS + timeout))
+  local selector="app.kubernetes.io/instance=splunk-${AI_STANDALONE_NAME}-standalone"
+  local remaining poll_seconds
+
   log "Waiting for Splunk Standalone to be ready..."
-  if kubectl wait --for=condition=ready pod -l "app.kubernetes.io/instance=${AI_STANDALONE_NAME}" -n "${AI_NS}" --timeout=600s; then
-    log "Splunk Standalone is ready"
-  elif airgap_cpu_profile_selected; then
+  while (( (remaining = deadline - SECONDS) > 0 )); do
+    # The operator creates the Pod asynchronously. kubectl wait returns
+    # immediately when its selector has no matches, so first wait for a Pod.
+    if [[ -n "$(kubectl get pods -n "${AI_NS}" -l "${selector}" -o name 2>/dev/null)" ]]; then
+      if kubectl wait --for=condition=Ready pod -l "${selector}" -n "${AI_NS}" \
+          --timeout="${remaining}s"; then
+        log "Splunk Standalone is ready"
+        return 0
+      fi
+    fi
+
+    remaining=$((deadline - SECONDS))
+    if (( remaining > 0 )); then
+      poll_seconds=5
+      (( remaining < poll_seconds )) && poll_seconds="${remaining}"
+      sleep "${poll_seconds}"
+    fi
+  done
+
+  if airgap_cpu_profile_selected; then
     err "Splunk Standalone did not become Ready in the air-gapped CPU-only cluster"
   else
     warn "Splunk Standalone readiness timed out"
@@ -8224,7 +8248,7 @@ join_workers() {
 
     # Install worker with fresh token
     log "  Installing k0s worker configuration..."
-    if ssh_exec "${worker_ip}" "echo '${worker_token}' | sudo tee /tmp/k0s-token >/dev/null && sudo k0s install worker --token-file=/tmp/k0s-token"; then
+    if ssh_exec "${worker_ip}" "printf '%s\n' '${worker_token}' | sudo install -m 600 /dev/stdin /tmp/k0s-token && sudo k0s install worker --token-file=/tmp/k0s-token"; then
       log "  ✓ Worker configuration installed"
     else
       warn "  Failed to install worker configuration on ${worker_ip}"

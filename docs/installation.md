@@ -314,7 +314,9 @@ air-gapped mode, and report every conflict at once:
   default to `saia`);
 - `nodes.gpuWorkers: 0`;
 - no `aiPlatform.defaultAcceleratorType`;
-- `storage.modelStaging.enabled: false` (it defaults to `true` when omitted);
+- `storage.modelStaging.enabled: false` (it defaults to `true` when omitted). A
+  `cpuOnly` install never prompts for model staging and no answer can turn it on,
+  and the standalone `stage-artifacts` command refuses to run;
 - `aiPlatform.sidecars.envoy`, `otel` and `prometheusOperator` all `false` (they
   default from `components.otel` and `components.monitoring`);
 - `aiPlatform.scaleFactor` omitted or `1` (it multiplies GPU capacity, which this

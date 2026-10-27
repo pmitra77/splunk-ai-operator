@@ -314,7 +314,9 @@ air-gapped mode, and report every conflict at once:
   default to `saia`);
 - `nodes.gpuWorkers: 0`;
 - no `aiPlatform.defaultAcceleratorType`;
-- `storage.modelStaging.enabled: false` (it defaults to `true` when omitted);
+- `storage.modelStaging.enabled: false` (it defaults to `true` when omitted). A
+  `cpuOnly` install never prompts for model staging and no answer can turn it on,
+  and the standalone `stage-artifacts` command refuses to run;
 - `aiPlatform.sidecars.envoy`, `otel` and `prometheusOperator` all `false` (they
   default from `components.otel` and `components.monitoring`);
 - `aiPlatform.scaleFactor` omitted or `1` (it multiplies GPU capacity, which this
@@ -351,6 +353,14 @@ aiPlatform:
 The AIPlatform admission webhook rejects the same combinations, but only when the
 resource is applied, after the cluster and Secrets exist. Switching an existing
 full-feature AIPlatform to `cpuOnly` is not supported.
+
+The reverse is rejected too: switching an existing `cpuOnly` AIPlatform to `full`,
+including by removing `aiPlatform.profile`, fails with an error on `spec.profile`,
+so a deployment is never left half-converted. To change profile, delete the
+AIPlatform and install again with the other profile. The admission webhook
+(`webhook.enabled: true`, the default) enforces both directions. Without the
+webhook the operator still refuses a `cpuOnly` AIPlatform that has already run
+model serving, but it cannot detect a `cpuOnly` to `full` change.
 
 ---
 

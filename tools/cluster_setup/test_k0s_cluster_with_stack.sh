@@ -100,6 +100,8 @@ _load_functions() {
   eval "$(_extract_fn config_bool)"
   eval "$(_extract_fn load_config)"
   eval "$(_extract_fn validate_cpu_profile_consistency)"
+  eval "$(_extract_fn resolve_model_staging)"
+  eval "$(_extract_fn stage_model_artifacts)"
   eval "$(_extract_fn render_las_feature_yaml)"
   eval "$(_extract_fn render_las_secret_refs)"
   eval "$(_extract_fn check_las_metrics_prerequisite)"
@@ -489,6 +491,54 @@ assert_eq "main_install checks cpuOnly consistency before model staging" "1" \
 assert_eq "validate runs the cpuOnly consistency check" "1" \
   "$(grep -c -E '^  validate_cpu_profile_consistency$' <<<"${_validate_body}" || true)"
 rm -rf "${_profile_tmpdir}"
+
+# ── Tests: cpuOnly never stages models (review finding on #259) ──────────────
+# The interactive prompt in resolve_model_staging used to override the validated
+# storage.modelStaging.enabled: false, after which the downloader asked for a GPU
+# type. read -p only echoes its prompt on a terminal, so these tests check the
+# effect: the resulting value, and whether the typed answer was consumed.
+suite "resolve_model_staging"
+echo "▶ resolve_model_staging"
+
+# args: profile airgap silent configured answer  ->  "<MODEL_STAGING_ENABLED>:<unread input>"
+_staging_run() {
+  (
+    AI_PLATFORM_PROFILE="$1"; AIRGAP_MODE="$2"; SILENT_INSTALL="$3"; MODEL_STAGING_ENABLED="$4"
+    { resolve_model_staging >/dev/null 2>&1; IFS= read -r _left || _left=""; printf '%s:%s' "${MODEL_STAGING_ENABLED}" "${_left}"; } <<<"$5"
+  )
+}
+assert_eq "cpuOnly, connected, interactive 'y' does not turn staging on and is not consumed" "false:y" "$(_staging_run cpuOnly false false false y)"
+assert_eq "cpuOnly, connected, interactive, config true is forced off and not prompted" "false:y" "$(_staging_run cpuOnly false false true y)"
+assert_eq "cpuOnly, silent, config true is forced off" "false:y" "$(_staging_run cpuOnly false true true y)"
+assert_eq "cpuOnly, air-gapped, config true is forced off without an error" "false:y" "$(_staging_run cpuOnly true false true y)"
+assert_eq "full, interactive 'y' still turns staging on (prompt consumed)" "true:" "$(_staging_run full false false false y)"
+assert_eq "full, interactive 'n' keeps staging off" "false:" "$(_staging_run full false false true n)"
+assert_eq "full, interactive empty answer keeps staging off" "false:" "$(_staging_run full false false true '')"
+assert_eq "omitted profile, interactive 'y' still turns staging on" "true:" "$(_staging_run '' false false false y)"
+assert_eq "full, silent keeps the configured true" "true:y" "$(_staging_run full false true true y)"
+assert_eq "full, silent keeps the configured false" "false:y" "$(_staging_run full false true false y)"
+assert_eq "full, air-gapped with staging off is unchanged" "false:y" "$(_staging_run full true false false y)"
+_full_airgap_rc=0
+( AI_PLATFORM_PROFILE=full; AIRGAP_MODE=true; SILENT_INSTALL=false; MODEL_STAGING_ENABLED=true; resolve_model_staging ) >/dev/null 2>&1 || _full_airgap_rc=$?
+assert_eq "full, air-gapped with staging on is still rejected" "1" "${_full_airgap_rc}"
+
+# The standalone stage-artifacts command skips resolve_model_staging and calls
+# stage_model_artifacts directly, so that function refuses cpuOnly itself.
+_stage_rc=0
+_stage_out=$( ( AI_PLATFORM_PROFILE=cpuOnly; stage_model_artifacts ) 2>&1 ) || _stage_rc=$?
+assert_eq "stage_model_artifacts refuses cpuOnly" "1" "${_stage_rc}"
+assert_eq "the refusal names the profile" "1" "$(grep -c 'not supported for aiPlatform.profile: cpuOnly' <<<"${_stage_out}" || true)"
+assert_eq "the refusal comes before any staging work starts" "0" "$(grep -c 'Model staging directory' <<<"${_stage_out}" || true)"
+_stage_body=$(_extract_fn stage_model_artifacts)
+_guard_line=$(grep -n -m1 'AI_PLATFORM_PROFILE:-}" == "cpuOnly"' <<<"${_stage_body}" | cut -d: -f1)
+_first_work_line=$(grep -n -m1 'staging_dir=' <<<"${_stage_body}" | cut -d: -f1)
+assert_eq "the cpuOnly guard is the first thing stage_model_artifacts does" "1" \
+  "$([[ -n "${_guard_line}" && -n "${_first_work_line}" ]] && (( _guard_line < _first_work_line )) && echo 1 || echo 0)"
+_install_body=$(_extract_fn main_install)
+_resolve_line=$(grep -n -m1 '^  resolve_model_staging$' <<<"${_install_body}" | cut -d: -f1)
+_validate_line=$(grep -n -m1 '^  validate_cpu_profile_consistency$' <<<"${_install_body}" | cut -d: -f1)
+assert_eq "main_install still validates cpuOnly before resolving staging" "1" \
+  "$([[ -n "${_resolve_line}" && -n "${_validate_line}" ]] && (( _validate_line < _resolve_line )) && echo 1 || echo 0)"
 
 # ── Tests: build_image_url ─────────────────────────────────────────────────────
 

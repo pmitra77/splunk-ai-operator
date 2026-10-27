@@ -394,7 +394,15 @@ _check_node_os() {
 # Called after load_config, before show_install_plan.
 # In Full (interactive) mode: always prompts; answer overrides storage.modelStaging.enabled.
 # In Silent mode: honours the config value with no prompt.
+# The cpuOnly profile has no hosted models to stage: it never prompts, and no
+# answer or config value can turn staging on (validate_cpu_profile_consistency
+# already requires the config value to be false).
 resolve_model_staging() {
+  if [[ "${AI_PLATFORM_PROFILE:-}" == "cpuOnly" ]]; then
+    MODEL_STAGING_ENABLED=false
+    log "cpuOnly profile: model staging skipped; there are no hosted models to stage."
+    return 0
+  fi
   if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
     [[ "${MODEL_STAGING_ENABLED}" == "false" ]] || err "storage.modelStaging.enabled must be false in air-gap mode"
     log "Air-gap mode: model staging skipped; models must already exist in the private object store."
@@ -3030,6 +3038,11 @@ all_models_staged() {
 # workers start. Reads HF credentials from model_artifacts_configs.yaml (in the
 # same directory as the upload/download scripts — no extra env vars needed for HF).
 stage_model_artifacts() {
+  # Also reached by the standalone stage-artifacts command, which does not go
+  # through resolve_model_staging. Fail before any download or upload.
+  if [[ "${AI_PLATFORM_PROFILE:-}" == "cpuOnly" ]]; then
+    err "Model staging is not supported for aiPlatform.profile: cpuOnly (no hosted models). Nothing was downloaded or uploaded."
+  fi
   local staging_dir
   staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
     || { err "Cannot locate artifacts_download_upload_scripts directory (expected sibling of cluster_setup/)"; return 1; }

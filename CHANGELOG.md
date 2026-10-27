@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive badge collection in README (25+ badges)
 - Workflow audit documentation for GHCR migration
 - k0s installer validates `aiPlatform.profile: cpuOnly` for every install, connected or air-gapped. Conflicting SAIA, GPU, model-staging, accelerator, scale-factor, sidecar, NVIDIA or KubeRay settings now fail `validate` and `install` before any cluster change instead of at AIPlatform admission. `cpuOnly` configurations must set `components.kuberay: false` explicitly and keep it that way.
+- The AIPlatform admission webhook now also rejects switching an existing `cpuOnly` AIPlatform to `full` (or removing `aiPlatform.profile`), matching the existing `full` to `cpuOnly` rule, so a profile change can no longer leave a half-converted deployment. New tests pin the per-profile reconcile stages, the `cpuOnly` resource set, repeat-reconcile stability and the absence of GPU requirements.
+- k0s installer: a `cpuOnly` install no longer shows the interactive "Download & stage models?" prompt, so answering yes can no longer override `storage.modelStaging.enabled: false` and lead to a GPU model download. The standalone `stage-artifacts` command also refuses `cpuOnly` before any transfer.
 
 ### Changed
 - README badges reorganized into logical categories

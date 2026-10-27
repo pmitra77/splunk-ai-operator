@@ -65,44 +65,7 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 	}()
 	var scaleResult reconcile.Result
 
-	type stage struct {
-		name string
-		fn   func(context.Context, *aiApi.AIPlatform) error
-	}
-	stages := []stage{{"Validate", r.validate}}
-	if p.Spec.Profile == aiApi.AIPlatformProfileCPUOnly {
-		// The CPU-only profile has no Ray, vector database, or Ray-backed ingress.
-		// Sidecars are also omitted because their platform resources include
-		// Ray-specific Prometheus rules even when all sidecar flags are false.
-		stages = append(stages,
-			stage{"AIService", r.ReconcileFeatures},
-			stage{"AIServiceStatus", r.CheckAIServiceStatus},
-		)
-	} else {
-		raybuilder := raybuilder.New(r.p, r.Client, r.Scheme, r.Recorder)
-		sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
-		stages = append(stages, []stage{
-			//{"ApplicationsConfigMap", raybuilder.ReconcileApplicationsConfigMap},
-			//{"InstancesConfigMap", raybuilder.ReconcileInstancesConfigMap},
-			//{"ServeConfigMap", raybuilder.ReconcileServeConfigMap},
-			{"Sidecars", sidecarBuilder.Reconcile},
-			{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
-			{"RayService", raybuilder.ReconcileRayService},
-			{"ActiveClusterScale", func(ctx context.Context, p *aiApi.AIPlatform) error {
-				var err error
-				scaleResult, err = raybuilder.ReconcileActiveClusterScale(ctx, p)
-				return err
-			}},
-			{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
-			{"Ingress", r.ReconcileIngress},
-			// collect status of each stage
-			{"RayServiceStatus", raybuilder.ApplyNormalizedConditions},
-			{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
-			{"IngressStatus", r.UpdateIngressStatus},
-			{"AIService", r.ReconcileFeatures},
-			{"AIServiceStatus", r.CheckAIServiceStatus},
-		}...)
-	}
+	stages := r.stagesFor(p, &scaleResult)
 
 	for _, stage := range stages {
 		err := stage.fn(ctx, p)
@@ -145,6 +108,51 @@ func (r *AIPlatformReconciler) Reconcile(ctx context.Context, p *aiApi.AIPlatfor
 	})
 
 	return scaleResult, nil
+}
+
+// reconcileStage is one ordered step of an AIPlatform reconcile. Its name
+// becomes the "<name>Ready" status condition type, so renaming a stage is an API change.
+type reconcileStage struct {
+	name string
+	fn   func(context.Context, *aiApi.AIPlatform) error
+}
+
+// stagesFor returns the ordered stages for the platform's profile. The
+// ActiveClusterScale stage stores its requeue result in scaleResult.
+func (r *AIPlatformReconciler) stagesFor(p *aiApi.AIPlatform, scaleResult *reconcile.Result) []reconcileStage {
+	stages := []reconcileStage{{"Validate", r.validate}}
+	if p.Spec.Profile == aiApi.AIPlatformProfileCPUOnly {
+		// The CPU-only profile has no Ray, vector database, or Ray-backed ingress.
+		// Sidecars are also omitted because their platform resources include
+		// Ray-specific Prometheus rules even when all sidecar flags are false.
+		return append(stages,
+			reconcileStage{"AIService", r.ReconcileFeatures},
+			reconcileStage{"AIServiceStatus", r.CheckAIServiceStatus},
+		)
+	}
+	raybuilder := raybuilder.New(r.p, r.Client, r.Scheme, r.Recorder)
+	sidecarBuilder := sidecars.New(r.Client, r.Scheme, r.Recorder, r.p)
+	return append(stages, []reconcileStage{
+		//{"ApplicationsConfigMap", raybuilder.ReconcileApplicationsConfigMap},
+		//{"InstancesConfigMap", raybuilder.ReconcileInstancesConfigMap},
+		//{"ServeConfigMap", raybuilder.ReconcileServeConfigMap},
+		{"Sidecars", sidecarBuilder.Reconcile},
+		{"rayAutoscalerRBAC", raybuilder.ReconcileRayAutoscalerRBAC},
+		{"RayService", raybuilder.ReconcileRayService},
+		{"ActiveClusterScale", func(ctx context.Context, p *aiApi.AIPlatform) error {
+			var err error
+			*scaleResult, err = raybuilder.ReconcileActiveClusterScale(ctx, p)
+			return err
+		}},
+		{"WeaviateDatabase", r.ReconcileWeaviateDatabase},
+		{"Ingress", r.ReconcileIngress},
+		// collect status of each stage
+		{"RayServiceStatus", raybuilder.ApplyNormalizedConditions},
+		{"WeaviateDatabaseStatus", r.ReconcileWeaviateDatabaseStatus},
+		{"IngressStatus", r.UpdateIngressStatus},
+		{"AIService", r.ReconcileFeatures},
+		{"AIServiceStatus", r.CheckAIServiceStatus},
+	}...)
 }
 
 // ReconcileFeatures ensures each feature's AIService exists and is up to date.

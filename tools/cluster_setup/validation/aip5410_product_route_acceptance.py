@@ -113,18 +113,21 @@ def assert_expected_result(events: list[Any], expected: Any, check: str) -> None
     if not isinstance(expected, str) or not expected.strip():
         raise AssertionError(f"{check} needs a non-empty expected result")
     result_values = [
-        event["result"]
+        event["response"]
         for event in events
-        if isinstance(event, dict) and isinstance(event.get("result"), str)
+        if isinstance(event, dict)
+        and event.get("status") == "Completed"
+        and isinstance(event.get("response"), str)
     ]
     if expected not in "\n".join(result_values):
-        raise AssertionError(f"{check} missed its expected result in the caller result field")
+        raise AssertionError(f"{check} missed its expected text in the completed caller response")
 
 
 async def main():
     from slim_api.models.aws import CreateAgentPayload
     from slim_api.routers.las_agent import create_agent, delete_agent
     from slim_api.util.las_client import get_las_client
+    from slim_api.util.las_utils import get_proper_thread_id
 
     config = json.load(sys.stdin)
     cases = config.get("cases") if isinstance(config, dict) else None
@@ -138,7 +141,7 @@ async def main():
     request = SimpleNamespace(headers={"request_id": f"aip5410-{token}-create"})
     created = await create_agent(
         tenant,
-        CreateAgentPayload(agent_name=f"aip5410-{token}", app_version="aip5410-acceptance"),
+        CreateAgentPayload(agent_name=f"aip5410{token}", app_version="aip5410-acceptance"),
         request,
     )
     if created.status_code != 201:
@@ -157,6 +160,7 @@ async def main():
             if not isinstance(calls, list) or not calls:
                 raise ValueError("each product case needs one or more calls")
             session_id = str(uuid.uuid4())
+            thread_id = get_proper_thread_id(tenant, session_id)
             for call_index, call in enumerate(calls):
                 if not isinstance(call, dict) or not isinstance(call.get("task_prompt"), str):
                     raise ValueError("each call needs task_prompt")
@@ -183,13 +187,13 @@ async def main():
                 assert_absent(captured, secrets, "caller logs")
                 check_names.append(f"{case['name']}:call-{call_index + 1}")
 
-            state = jsonable(await client.threads.get_state(session_id))
+            state = jsonable(await client.threads.get_state(thread_id))
             values = state.get("values", {}) if isinstance(state, dict) else {}
             state_text = "\n".join(strings(values))
             if not all(call.get("expected_text") in state_text for call in calls):
                 raise AssertionError(f"case {case['name']} expected outputs were not in graph state values")
             assert_absent(values, secrets, "graph state values")
-            history = await all_checkpoints(client, session_id)
+            history = await all_checkpoints(client, thread_id)
             assert_absent(history, secrets, "checkpoint history")
             check_names.extend((f"{case['name']}:state-values", f"{case['name']}:checkpoint-redaction"))
     finally:

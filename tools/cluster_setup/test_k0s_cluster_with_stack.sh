@@ -89,7 +89,7 @@ _load_functions() {
 
   # Extract _POD_FS assignment (single line, not a function)
   eval "$(grep '^_POD_FS=' "${SCRIPT}")"
-
+  eval "$(_extract_fn component_enabled)"
   eval "$(_extract_fn model_artifacts_config_name)"
   eval "$(_extract_fn build_image_url)"
   eval "$(_extract_fn validate_image_config)"
@@ -101,7 +101,11 @@ _load_functions() {
   eval "$(_extract_fn load_config)"
   eval "$(_extract_fn validate_cpu_profile_consistency)"
   eval "$(_extract_fn resolve_model_staging)"
+  eval "$(_extract_fn resolve_accelerator_type)"
   eval "$(_extract_fn stage_model_artifacts)"
+  eval "$(_extract_fn install_nvidia_host_drivers)"
+  eval "$(_extract_fn install_nvidia_device_plugin)"
+  eval "$(_extract_fn install_ai_platform_cr)"
   eval "$(_extract_fn render_las_feature_yaml)"
   eval "$(_extract_fn render_las_secret_refs)"
   eval "$(_extract_fn check_las_metrics_prerequisite)"
@@ -113,6 +117,7 @@ _load_functions() {
 }
 
 _load_functions
+eval "$(grep '^readonly SUPPORTED_ACCELERATORS=' "${SCRIPT}")"
 
 # Tests: Splunk Standalone is discovered before readiness is awaited
 suite "wait_for_splunk_standalone"
@@ -615,6 +620,108 @@ _resolve_line=$(grep -n -m1 '^  resolve_model_staging$' <<<"${_install_body}" | 
 _validate_line=$(grep -n -m1 '^  validate_cpu_profile_consistency$' <<<"${_install_body}" | cut -d: -f1)
 assert_eq "main_install still validates cpuOnly before resolving staging" "1" \
   "$([[ -n "${_resolve_line}" && -n "${_validate_line}" ]] && (( _validate_line < _resolve_line )) && echo 1 || echo 0)"
+
+# The standalone stage-artifacts command bypasses resolve_model_staging. It
+# must refuse an air-gapped full profile before reaching the public downloader.
+_stage_airgap_rc=0
+_stage_airgap_out=$( ( AI_PLATFORM_PROFILE=full; AIRGAP_MODE=true; DEFAULT_ACCELERATOR=H100; stage_model_artifacts ) 2>&1 ) || _stage_airgap_rc=$?
+assert_eq "stage-artifacts refuses air-gapped mode" "1" "${_stage_airgap_rc}"
+assert_eq "air-gapped refusal names the mode" "1" "$(grep -c 'not supported in air-gapped mode' <<<"${_stage_airgap_out}" || true)"
+assert_eq "air-gapped refusal precedes staging work" "0" "$(grep -c 'Model staging directory\|Downloading model artifacts' <<<"${_stage_airgap_out}" || true)"
+_stage_dispatch=$(sed -n '/^  stage-artifacts)/,/^    ;;$/p' "${SCRIPT}")
+_stage_load_line=$(grep -n -m1 '^[[:space:]]*load_config$' <<<"${_stage_dispatch}" | cut -d: -f1)
+_stage_resolve_line=$(grep -n -m1 '^[[:space:]]*resolve_accelerator_type$' <<<"${_stage_dispatch}" | cut -d: -f1)
+_stage_transfer_line=$(grep -n -m1 '^[[:space:]]*stage_model_artifacts$' <<<"${_stage_dispatch}" | cut -d: -f1)
+assert_eq "stage-artifacts loads mode and validates accelerator before staging" "1" \
+  "$([[ -n "${_stage_load_line}" && -n "${_stage_resolve_line}" && -n "${_stage_transfer_line}" ]] && (( _stage_load_line < _stage_resolve_line && _stage_resolve_line < _stage_transfer_line )) && echo 1 || echo 0)"
+
+# ── Tests: accelerator selection preserves the full GPU path ───────────────
+suite "resolve_accelerator_type"
+_accelerator_result() (
+  AI_PLATFORM_PROFILE="$1"; DEFAULT_ACCELERATOR="$2"; SILENT_INSTALL=true
+  resolve_accelerator_type
+  printf '%s' "${DEFAULT_ACCELERATOR}"
+)
+assert_eq "full profile normalizes a supported accelerator" "H100" "$(_accelerator_result full h100)"
+assert_eq "full profile retains the Blackwell accelerator" "RTX_PRO_6000_BLACKWELL" "$(_accelerator_result full rtx_pro_6000_blackwell)"
+assert_eq "cpuOnly leaves the accelerator empty" "" "$(_accelerator_result cpuOnly '')"
+_unsupported_rc=0
+_unsupported_out=$(_accelerator_result full unsupported 2>&1) || _unsupported_rc=$?
+assert_eq "full profile rejects an unsupported accelerator" "1" "${_unsupported_rc}"
+assert_eq "unsupported accelerator error names the field" "1" "$(grep -c 'aiPlatform.defaultAcceleratorType' <<<"${_unsupported_out}" || true)"
+_missing_rc=0
+_accelerator_result full '' >/dev/null 2>&1 || _missing_rc=$?
+assert_eq "silent full install rejects a missing accelerator" "1" "${_missing_rc}"
+
+# ── Tests: CPU-only NVIDIA skip and full GPU gate ────────────────────────────
+suite "NVIDIA profile gating"
+_nvidia_gate() ( GPU_WORKER_COUNT="$1"; COMPONENT_NVIDIA="$2"; component_enabled nvidia )
+assert_rc "CPU-only configuration skips NVIDIA" 1 _nvidia_gate 0 false
+assert_rc "zero GPU workers skip NVIDIA even when the component defaults on" 1 _nvidia_gate 0 true
+assert_rc "full GPU configuration retains NVIDIA" 0 _nvidia_gate 1 true
+_nvidia_skip_trace() (
+  GPU_WORKER_COUNT=0
+  kubectl() { echo 'unexpected kubectl call'; return 1; }
+  ssh_exec() { echo 'unexpected ssh call'; return 1; }
+  curl() { echo 'unexpected curl call'; return 1; }
+  install_nvidia_host_drivers
+  install_nvidia_device_plugin
+)
+_nvidia_skip_rc=0
+_nvidia_skip_out=$(_nvidia_skip_trace 2>&1) || _nvidia_skip_rc=$?
+assert_eq "zero-GPU driver and device-plugin helpers return successfully" "0" "${_nvidia_skip_rc}"
+assert_eq "zero-GPU driver and device-plugin helpers call no external tools" "" "${_nvidia_skip_out}"
+
+# ── Tests: actual AIPlatform manifest profile rendering ────────────────────
+suite "AIPlatform profile manifest"
+_manifest_config=$(mktemp)
+cat > "${_manifest_config}" <<'YAML'
+aiPlatform:
+  features:
+    - name: slim
+    - name: agentruntime
+      provider: mltk
+YAML
+_platform_manifest() (
+  local profile="$1" output_file
+  output_file=$(mktemp)
+  trap 'rm -f "${output_file}"' EXIT
+  CONFIG_FILE="${_manifest_config}"
+  AI_PLATFORM_PROFILE="${profile}"
+  AIRGAP_MODE=false AI_NS=ai CLUSTER_NAME=profile-test SPLUNK_MODE=disabled
+  OBJ_STORE_TYPE=minio OBJ_STORE_BUCKET=ai-platform-data MINIO_ENDPOINT=http://minio.internal
+  AI_SIDECAR_ENVOY=false AI_SIDECAR_OTEL=false AI_SIDECAR_PROMETHEUS=false
+  VECTORDB_SIZE=50Gi STORAGE_CLASS=local-path WORKER_IMAGE_REGISTRY=registry.internal
+  DEFAULT_ACCELERATOR=H100
+  [[ "${profile}" == "cpuOnly" ]] && DEFAULT_ACCELERATOR=""
+  kubectl() {
+    if [[ " $* " == *" apply --server-side --force-conflicts -f - "* ]]; then
+      cat > "${output_file}"
+      return 0
+    fi
+    if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then printf '{"items":[]}\n'; return 0; fi
+    if [[ "${1:-}" == "get" && "${2:-}" == "secret" ]]; then return 1; fi
+    return 0
+  }
+  object_store_auth_looks_like_placeholder() { return 1; }
+  apply_s3compat_secret() { :; }
+  render_las_feature_yaml() { printf '      las:\n        assistantId: test\n'; }
+  render_las_secret_refs() { :; }
+  check_las_metrics_prerequisite() { :; }
+  python3() { [[ " $* " == *" provision-secrets "* ]] && printf '{"managed":false}\n'; return 0; }
+  install_ai_platform_cr >/dev/null 2>&1 || return 1
+  cat "${output_file}"
+)
+_cpu_manifest_rc=0
+_cpu_manifest=$(_platform_manifest cpuOnly) || _cpu_manifest_rc=$?
+assert_eq "CPU-only manifest renders" "0" "${_cpu_manifest_rc}"
+assert_eq "CPU-only manifest selects the profile" "cpuOnly" "$(printf '%s\n' "${_cpu_manifest}" | yq eval '.spec.profile' -)"
+assert_eq "CPU-only manifest omits the accelerator" "null" "$(printf '%s\n' "${_cpu_manifest}" | yq eval '.spec.defaultAcceleratorType' -)"
+_full_manifest_rc=0
+_full_manifest=$(_platform_manifest full) || _full_manifest_rc=$?
+assert_eq "full manifest renders" "0" "${_full_manifest_rc}"
+assert_eq "full manifest retains the accelerator" "H100" "$(printf '%s\n' "${_full_manifest}" | yq eval '.spec.defaultAcceleratorType' -)"
+rm -f "${_manifest_config}"
 
 # ── Tests: build_image_url ─────────────────────────────────────────────────────
 

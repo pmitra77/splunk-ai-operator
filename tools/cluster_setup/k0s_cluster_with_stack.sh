@@ -3043,6 +3043,11 @@ stage_model_artifacts() {
   if [[ "${AI_PLATFORM_PROFILE:-}" == "cpuOnly" ]]; then
     err "Model staging is not supported for aiPlatform.profile: cpuOnly (no hosted models). Nothing was downloaded or uploaded."
   fi
+  # The standalone command also bypasses the install-time air-gap staging
+  # decision. Reject it here so it cannot reach the public downloader.
+  if [[ "${AIRGAP_MODE:-false}" == "true" ]]; then
+    err "Model staging is not supported in air-gapped mode; pre-stage models in the internal object store before installation. Nothing was downloaded or uploaded."
+  fi
   local staging_dir
   staging_dir="$(cd "$(dirname "$0")/../artifacts_download_upload_scripts" && pwd)" \
     || { err "Cannot locate artifacts_download_upload_scripts directory (expected sibling of cluster_setup/)"; return 1; }
@@ -3071,15 +3076,11 @@ stage_model_artifacts() {
     return 0
   fi
 
-  # ---- Check HuggingFace reachability (skip in air-gap mode) ----
-  if [[ "${AIRGAP_MODE:-false}" != "true" ]]; then
-    wait_for_dependency \
-      "HuggingFace (huggingface.co) — required for model weight download" \
-      "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
-      300
-  else
-    log "AIRGAP_MODE=true — skipping HuggingFace connectivity check (models must be pre-staged in object store)"
-  fi
+  # ---- Check HuggingFace reachability (connected staging only) ----
+  wait_for_dependency \
+    "HuggingFace (huggingface.co) — required for model weight download" \
+    "curl -sf --connect-timeout 10 --max-time 15 https://huggingface.co >/dev/null 2>&1" \
+    300
 
   # ---- Download from Hugging Face ----
   log "Downloading model artifacts from Hugging Face (accelerator: ${_accel}, skip-if-staged: ${_skip_staged})..."

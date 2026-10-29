@@ -714,30 +714,48 @@ class KubectlClient:
 
 
 def require_ready_condition(
-    resource: dict[str, Any], description: str
+    resource: dict[str, Any],
+    description: str,
+    *,
+    require_condition_generation: bool = False,
 ) -> dict[str, Any]:
     metadata, status = _dict(
         resource.get("metadata"), f"{description} metadata"
     ), _dict(resource.get("status"), f"{description} status")
     generation = metadata.get("generation")
+    observed_generation = status.get("observedGeneration")
     if (
-        not isinstance(generation, int)
-        or status.get("observedGeneration", -1) < generation
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or isinstance(observed_generation, bool)
+        or not isinstance(observed_generation, int)
+        or observed_generation < generation
     ):
         raise QualificationError(
             f"{description} has not observed its current generation"
         )
     conditions = _list(status.get("conditions", []), f"{description} conditions")
     condition = next((item for item in conditions if item.get("type") == "Ready"), None)
-    if (
-        not condition
-        or condition.get("status") != "True"
-        or condition.get("observedGeneration", -1) < generation
-    ):
+    if not condition or condition.get("status") != "True":
         reason = condition.get("reason", "missing") if condition else "missing"
         raise QualificationError(
             f"{description} is not Ready for its current generation ({reason})"
         )
+    if "observedGeneration" not in condition:
+        if require_condition_generation:
+            raise QualificationError(
+                f"{description} Ready condition has no observed generation"
+            )
+    else:
+        condition_generation = condition["observedGeneration"]
+        if (
+            isinstance(condition_generation, bool)
+            or not isinstance(condition_generation, int)
+            or condition_generation < generation
+        ):
+            raise QualificationError(
+                f"{description} Ready condition is stale or malformed"
+            )
     return {
         "name": metadata.get("name"),
         "generation": generation,
@@ -764,7 +782,11 @@ def validate_platform_and_service(
         raise QualificationError(
             "live AIPlatform does not select exactly agentruntime and slim"
         )
-    service_summary = require_ready_condition(service, "Agent Runtime AIService")
+    service_summary = require_ready_condition(
+        service,
+        "Agent Runtime AIService",
+        require_condition_generation=True,
+    )
     if nested(service, "spec", "features", "name") != "agentruntime":
         raise QualificationError("selected AIService is not the agentruntime feature")
     if nested(service, "spec", "aiPlatformRef", "name") != platform_name:
@@ -1248,14 +1270,31 @@ def allowed_inventory_digests(entry: dict[str, Any], platform: str) -> set[str]:
         os_name, architecture = platform.split("/", 1)
     except ValueError:
         raise QualificationError(f"invalid node platform: {platform}") from None
-    allowed = {entry.get("digest")}
-    for item in entry.get("platforms", []):
-        if (
-            item.get("os") == os_name
-            and item.get("architecture") == architecture
-            and item.get("digest")
-        ):
-            allowed.add(item["digest"])
+    matches = [
+        item
+        for item in entry.get("platforms", [])
+        if item.get("os") == os_name and item.get("architecture") == architecture
+    ]
+    identities: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for item in matches:
+        identities.setdefault(
+            (
+                item.get("variant"),
+                item.get("digest"),
+                item.get("runtimeDigest"),
+            ),
+            item,
+        )
+    if not identities:
+        raise QualificationError(
+            f"image inventory has no identity for node platform: {platform}"
+        )
+    if len(identities) != 1:
+        raise QualificationError(
+            f"image inventory has ambiguous identities for node platform: {platform}"
+        )
+    item = next(iter(identities.values()))
+    allowed = {entry.get("digest"), item.get("digest"), item.get("runtimeDigest")}
     return {
         value
         for value in allowed
@@ -1612,7 +1651,28 @@ def qualify(
         args.expected_bundle_sha256,
         checksum["manifestSha256"],
     )
-    entry = inventory_entry(inventory, expected_image)
+    configured_images = {"LAS": expected_image, **supporting_images}
+    inventory_entries: dict[str, dict[str, Any]] = {}
+    inventory_module = _load_inventory_module()
+    target_platform = (
+        inventory.get("targetPlatform")
+        if inventory.get("schemaVersion") == 2
+        else "linux/amd64"
+    )
+    for component, reference in configured_images.items():
+        entry = inventory_entry(inventory, reference)
+        try:
+            inventory_module.enrich_image_runtime_digests(
+                Path(args.bundle_dir),
+                entry,
+                target_platform=target_platform,
+            )
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise QualificationError(
+                f"offline {component} runtime identity chain is invalid: {exc}"
+            ) from None
+        inventory_entries[component] = entry
+    entry = inventory_entries["LAS"]
     network = validate_network_evidence(
         load_structured_file(Path(args.network_evidence), "network evidence"),
         max_age_seconds=args.network_max_age_seconds,
@@ -1639,6 +1699,10 @@ def qualify(
         )
     nodes = kube.get("nodes", namespaced=False)
     architectures, node_summaries = validate_nodes(nodes)
+    if set(architectures.values()) != {target_platform}:
+        raise QualificationError(
+            "live node platforms differ from the qualified bundle target"
+        )
     workloads = kube.get("deployments,statefulsets,daemonsets")
     all_pods = kube.get("pods")
     reject_forbidden_workloads(workloads, all_pods)
@@ -1802,6 +1866,11 @@ def qualify(
                 item.get("digest")
                 for item in entry.get("platforms", [])
                 if item.get("digest")
+            ],
+            "inventoryRuntimeDigests": [
+                item.get("runtimeDigest")
+                for item in entry.get("platforms", [])
+                if item.get("runtimeDigest")
             ],
             "importArchives": entry.get("importArchives", []),
             "embeddedChartPath": distribution.get("path", ""),

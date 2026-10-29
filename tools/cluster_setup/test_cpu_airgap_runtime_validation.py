@@ -19,12 +19,75 @@ SPEC = importlib.util.spec_from_file_location("validate_cpu_airgap_runtime", SCR
 runtime = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runtime)
 
-SHA_A = "sha256:" + "a" * 64
-SHA_B = "sha256:" + "b" * 64
-SHA_C = "sha256:" + "c" * 64
-SHA_D = "sha256:" + "d" * 64
-SHA_E = "sha256:" + "e" * 64
-SHA_F = "sha256:" + "f" * 64
+OCI_CONFIG = json.dumps(
+    {"architecture": "amd64", "os": "linux"}, separators=(",", ":")
+).encode()
+SHA_A = "sha256:" + hashlib.sha256(OCI_CONFIG).hexdigest()
+OCI_PLATFORM_MANIFEST = json.dumps(
+    {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": SHA_A,
+            "size": len(OCI_CONFIG),
+        },
+        "layers": [],
+    },
+    separators=(",", ":"),
+).encode()
+SHA_B = "sha256:" + hashlib.sha256(OCI_PLATFORM_MANIFEST).hexdigest()
+OCI_IMAGE_INDEX = json.dumps(
+    {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": SHA_B,
+                "size": len(OCI_PLATFORM_MANIFEST),
+                "platform": {"os": "linux", "architecture": "amd64"},
+            }
+        ],
+    },
+    separators=(",", ":"),
+).encode()
+SHA_TOP = "sha256:" + hashlib.sha256(OCI_IMAGE_INDEX).hexdigest()
+
+
+def single_manifest_fixture(identity):
+    config = json.dumps(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {"Labels": {"fixture.identity": identity}},
+        },
+        separators=(",", ":"),
+    ).encode()
+    runtime_digest = "sha256:" + hashlib.sha256(config).hexdigest()
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": runtime_digest,
+                "size": len(config),
+            },
+            "layers": [],
+        },
+        separators=(",", ":"),
+    ).encode()
+    manifest_digest = "sha256:" + hashlib.sha256(manifest).hexdigest()
+    return config, runtime_digest, manifest, manifest_digest
+
+
+OCI_CONFIG_C, SHA_C, OCI_MANIFEST_C, SHA_TOP_C = single_manifest_fixture("operator")
+OCI_CONFIG_D, SHA_D, OCI_MANIFEST_D, SHA_TOP_D = single_manifest_fixture("slim")
+OCI_CONFIG_E, SHA_E, OCI_MANIFEST_E, SHA_TOP_E = single_manifest_fixture("splunk")
+OCI_CONFIG_F, SHA_F, OCI_MANIFEST_F, SHA_TOP_F = single_manifest_fixture(
+    "splunk-operator"
+)
 ECR_ACCOUNT = "123456789012"
 ECR_REGISTRY = f"{ECR_ACCOUNT}.dkr.ecr.us-west-2.amazonaws.com"
 IMAGE = f"{ECR_REGISTRY}/launchpad-agent:v1"
@@ -33,6 +96,19 @@ SLIM_IMAGE = f"{ECR_REGISTRY}/slim:v1"
 SPLUNK_IMAGE = f"{ECR_REGISTRY}/splunk:v1"
 SPLUNK_OPERATOR_IMAGE = f"{ECR_REGISTRY}/splunk-operator:v1"
 SOURCE_COMMIT = "1" * 40
+
+SUPPORTING_OCI_FIXTURES = (
+    (OPERATOR_IMAGE, OCI_MANIFEST_C, SHA_TOP_C, OCI_CONFIG_C, SHA_C),
+    (SLIM_IMAGE, OCI_MANIFEST_D, SHA_TOP_D, OCI_CONFIG_D, SHA_D),
+    (SPLUNK_IMAGE, OCI_MANIFEST_E, SHA_TOP_E, OCI_CONFIG_E, SHA_E),
+    (
+        SPLUNK_OPERATOR_IMAGE,
+        OCI_MANIFEST_F,
+        SHA_TOP_F,
+        OCI_CONFIG_F,
+        SHA_F,
+    ),
+)
 
 
 def ready_condition(generation=1):
@@ -260,7 +336,56 @@ class RuntimeFixture:
             + "\n",
             encoding="utf-8",
         )
-        (self.bundle / "images/workload-images.tar").write_bytes(b"oci archive")
+        root_descriptors = [
+            {
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "digest": SHA_TOP,
+                "size": len(OCI_IMAGE_INDEX),
+                "annotations": {"org.opencontainers.image.ref.name": IMAGE},
+            }
+        ]
+        root_descriptors.extend(
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": manifest_digest,
+                "size": len(manifest),
+                "annotations": {"org.opencontainers.image.ref.name": reference},
+            }
+            for reference, manifest, manifest_digest, _, _ in SUPPORTING_OCI_FIXTURES
+        )
+        archive_index = json.dumps(
+            {
+                "schemaVersion": 2,
+                "manifests": root_descriptors,
+            },
+            separators=(",", ":"),
+        ).encode()
+        archive_members = [
+            ("index.json", archive_index),
+            (f"blobs/sha256/{SHA_TOP.removeprefix('sha256:')}", OCI_IMAGE_INDEX),
+            (f"blobs/sha256/{SHA_B.removeprefix('sha256:')}", OCI_PLATFORM_MANIFEST),
+            (f"blobs/sha256/{SHA_A.removeprefix('sha256:')}", OCI_CONFIG),
+        ]
+        for _, manifest, manifest_digest, config, runtime_digest in (
+            SUPPORTING_OCI_FIXTURES
+        ):
+            archive_members.extend(
+                (
+                    (
+                        f"blobs/sha256/{manifest_digest.removeprefix('sha256:')}",
+                        manifest,
+                    ),
+                    (
+                        f"blobs/sha256/{runtime_digest.removeprefix('sha256:')}",
+                        config,
+                    ),
+                )
+            )
+        with tarfile.open(self.bundle / "images/workload-images.tar", "w") as archive:
+            for name, payload in archive_members:
+                member = tarfile.TarInfo(name)
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
         chart_buffer = io.BytesIO()
         chart_yaml = b"apiVersion: v2\nname: langgraph-cloud\nversion: 0.3.5-splunk.2\n"
         with tarfile.open(fileobj=chart_buffer, mode="w:gz") as archive:
@@ -293,11 +418,11 @@ class RuntimeFixture:
                 }
             ],
             "images": [
-                image_entry(IMAGE, SHA_A, platform_digest),
-                image_entry(OPERATOR_IMAGE, SHA_C),
-                image_entry(SLIM_IMAGE, SHA_D),
-                image_entry(SPLUNK_IMAGE, SHA_E),
-                image_entry(SPLUNK_OPERATOR_IMAGE, SHA_F),
+                image_entry(IMAGE, SHA_TOP, platform_digest),
+                image_entry(OPERATOR_IMAGE, SHA_TOP_C),
+                image_entry(SLIM_IMAGE, SHA_TOP_D),
+                image_entry(SPLUNK_IMAGE, SHA_TOP_E),
+                image_entry(SPLUNK_OPERATOR_IMAGE, SHA_TOP_F),
             ],
             "embeddedDistribution": {
                 "path": "charts/las.tgz",
@@ -400,6 +525,24 @@ class RuntimeFixture:
         self.network.write_text(json.dumps(network), encoding="utf-8")
         self.output = root / "evidence"
         self.pod_digest = pod_digest
+
+    def rebuild_bundle_artifacts(self):
+        files = [
+            "bundle-profile.txt",
+            "source-commit.txt",
+            "images/workload-images.list",
+            "images/workload-images.tar",
+            "charts/las.tgz",
+            "image-inventory.json",
+        ]
+        manifest = "".join(
+            f"{runtime.sha256_file(self.bundle / relative)}  {relative}\n"
+            for relative in files
+        )
+        (self.bundle / "checksums.sha256").write_text(manifest, encoding="utf-8")
+        with tarfile.open(self.tarball, "w:gz") as archive:
+            archive.add(self.bundle, arcname="airgap-bundle")
+        self.tarball_sha256 = runtime.sha256_file(self.tarball)
 
     def args(self, replace=None, confirmed=False):
         return argparse.Namespace(
@@ -725,9 +868,91 @@ class CPUAirgapRuntimeTests(unittest.TestCase):
             serialized,
         )
         self.assertIn(SHA_A, serialized)
+        self.assertEqual(evidence["bundle"]["inventoryRuntimeDigests"], [SHA_A])
+        self.assertEqual(
+            evidence["requiredSupportingComponents"]["operator"]["runtimeDigests"],
+            [SHA_C],
+        )
+        self.assertEqual(
+            evidence["requiredSupportingComponents"]["slim"]["runtimeDigests"],
+            [SHA_D],
+        )
+        self.assertEqual(
+            evidence["requiredSupportingComponents"]["splunk"]["runtimeDigests"],
+            [SHA_E],
+        )
+        self.assertEqual(
+            evidence["requiredSupportingComponents"]["splunkOperator"][
+                "runtimeDigests"
+            ],
+            [SHA_F],
+        )
         written_json = (self.fixture.output / "mpr-129-evidence.json").read_text()
         self.assertNotIn(ECR_ACCOUNT, written_json)
         self.assertNotIn(ECR_ACCOUNT, markdown)
+
+    def test_supporting_inventory_digest_must_resolve_in_oci_archive(self):
+        inventory_path = self.fixture.bundle / "image-inventory.json"
+        inventory = json.loads(inventory_path.read_text())
+        operator = next(
+            item
+            for item in inventory["images"]
+            if item["reference"] == OPERATOR_IMAGE
+        )
+        mismatched_digest = "sha256:" + "9" * 64
+        operator["digest"] = mismatched_digest
+        operator["platforms"][0]["digest"] = mismatched_digest
+        inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+        self.fixture.rebuild_bundle_artifacts()
+        kube, _, _ = self.fixture.kube()
+        with self.assertRaisesRegex(
+            runtime.QualificationError,
+            "offline operator runtime identity chain is invalid",
+        ):
+            runtime.qualify(self.fixture.args(), kube=kube)
+
+    def test_legacy_multi_platform_inventory_qualifies_amd64_archive(self):
+        inventory_path = self.fixture.bundle / "image-inventory.json"
+        inventory = json.loads(inventory_path.read_text())
+        for item in inventory["images"]:
+            item["platforms"].append(
+                {
+                    "os": "linux",
+                    "architecture": "arm64",
+                    "variant": "v8",
+                    "digest": "sha256:" + "8" * 64,
+                }
+            )
+        inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+        self.fixture.rebuild_bundle_artifacts()
+        kube, _, _ = self.fixture.kube()
+        evidence = runtime.qualify(self.fixture.args(), kube=kube)
+        self.assertEqual(evidence["result"], "RUNTIME_PASS")
+        self.assertEqual(evidence["bundle"]["inventoryRuntimeDigests"], [SHA_A])
+
+    def test_legacy_unbundled_node_platform_is_rejected(self):
+        inventory_path = self.fixture.bundle / "image-inventory.json"
+        inventory = json.loads(inventory_path.read_text())
+        for item in inventory["images"]:
+            item["platforms"].append(
+                {
+                    "os": "linux",
+                    "architecture": "arm64",
+                    "variant": "v8",
+                    "digest": "sha256:" + "8" * 64,
+                }
+            )
+        inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+        self.fixture.rebuild_bundle_artifacts()
+        kube, _, _ = self.fixture.kube()
+        worker = kube.responses[FakeKubectl.key("nodes", namespaced=False)]["items"][1]
+        worker["metadata"]["labels"]["kubernetes.io/arch"] = "arm64"
+        worker["status"]["nodeInfo"]["architecture"] = "arm64"
+        with self.assertRaisesRegex(
+            runtime.QualificationError,
+            "node platforms differ from the qualified bundle target",
+        ):
+            runtime.qualify(self.fixture.args(), kube=kube)
 
     def test_platform_specific_digest_is_accepted_for_multi_arch_inventory(self):
         second = pathlib.Path(self.temporary.name) / "platform-digest"
@@ -901,6 +1126,125 @@ class CPUAirgapRuntimeTests(unittest.TestCase):
         service["metadata"]["generation"] = 2
         with self.assertRaisesRegex(runtime.QualificationError, "current generation"):
             runtime.qualify(self.fixture.args(), kube=kube)
+
+    def test_live_platform_and_slim_ready_shape_without_condition_generation(self):
+        kube, _, _ = self.fixture.kube()
+        platform = kube.responses[FakeKubectl.key("aiplatform", "platform")]
+        slim = kube.responses[FakeKubectl.key("aiservice", "platform-slim")]
+        del platform["status"]["conditions"][0]["observedGeneration"]
+        del slim["status"]["conditions"][0]["observedGeneration"]
+
+        evidence = runtime.qualify(self.fixture.args(), kube=kube)
+
+        self.assertEqual(evidence["aiplatform"]["observedGeneration"], 1)
+        self.assertEqual(evidence["slimAIService"]["observedGeneration"], 1)
+
+    def test_agentruntime_ready_condition_requires_generation(self):
+        kube, _, _ = self.fixture.kube()
+        service = kube.responses[FakeKubectl.key("aiservice", "agent")]
+        del service["status"]["conditions"][0]["observedGeneration"]
+
+        with self.assertRaisesRegex(
+            runtime.QualificationError, "Ready condition has no observed generation"
+        ):
+            runtime.qualify(self.fixture.args(), kube=kube)
+
+    def test_present_ready_condition_generation_must_be_current_integer(self):
+        resource = {
+            "metadata": {"name": "platform", "generation": 2},
+            "status": {
+                "observedGeneration": 2,
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "AllReconciled",
+                        "observedGeneration": 2,
+                    }
+                ],
+            },
+        }
+        for value in (1, None, "2", True):
+            with self.subTest(value=value):
+                resource["status"]["conditions"][0]["observedGeneration"] = value
+                with self.assertRaisesRegex(
+                    runtime.QualificationError, "stale or malformed"
+                ):
+                    runtime.require_ready_condition(resource, "AIPlatform")
+
+    def test_runtime_digest_is_allowed_without_platform_manifest_digest(self):
+        entry = {
+            "digest": SHA_TOP,
+            "platforms": [
+                {
+                    "os": "linux",
+                    "architecture": "amd64",
+                    "runtimeDigest": SHA_A,
+                }
+            ],
+        }
+        self.assertIn(
+            SHA_A, runtime.allowed_inventory_digests(entry, "linux/amd64")
+        )
+
+    def test_multiple_variants_for_one_node_platform_fail_closed(self):
+        entry = {
+            "digest": SHA_TOP,
+            "platforms": [
+                {
+                    "os": "linux",
+                    "architecture": "arm64",
+                    "variant": "v8",
+                    "digest": SHA_A,
+                },
+                {
+                    "os": "linux",
+                    "architecture": "arm64",
+                    "variant": "v9",
+                    "digest": SHA_B,
+                },
+            ],
+        }
+        with self.assertRaisesRegex(runtime.QualificationError, "ambiguous identities"):
+            runtime.allowed_inventory_digests(entry, "linux/arm64")
+
+    def test_missing_platform_identity_fails_closed(self):
+        entry = {
+            "digest": SHA_TOP,
+            "platforms": [
+                {
+                    "os": "linux",
+                    "architecture": "amd64",
+                    "digest": SHA_B,
+                    "runtimeDigest": SHA_A,
+                }
+            ],
+        }
+        with self.assertRaisesRegex(runtime.QualificationError, "no identity"):
+            runtime.allowed_inventory_digests(entry, "linux/arm64")
+
+    def test_same_variant_with_conflicting_digests_fails_closed(self):
+        entry = {
+            "digest": SHA_TOP,
+            "platforms": [
+                {
+                    "os": "linux",
+                    "architecture": "arm64",
+                    "variant": "v8",
+                    "digest": SHA_A,
+                    "runtimeDigest": SHA_C,
+                },
+                {
+                    "os": "linux",
+                    "architecture": "arm64",
+                    "variant": "v8",
+                    "digest": SHA_B,
+                    "runtimeDigest": SHA_D,
+                },
+            ],
+        }
+        with self.assertRaisesRegex(runtime.QualificationError, "ambiguous identities"):
+            runtime.allowed_inventory_digests(entry, "linux/arm64")
 
     def test_unready_las_deployment_is_rejected(self):
         kube, _, _ = self.fixture.kube()

@@ -35,6 +35,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./airgap-bundle}"
 CLUSTER_CONFIG=""
 MIRROR_REGISTRY="${MIRROR_REGISTRY:-}"
 CPU_ONLY_BUNDLE=false
+BUNDLE_PLATFORM="linux/amd64"
 LOCAL_PATH_HELPER_IMAGE="docker.io/library/busybox:1.36.1"
 SOURCE_COMMIT="${SOURCE_COMMIT:-}"
 
@@ -317,6 +318,7 @@ if "${STAGE_DIR}/binaries/k0s" airgap list-images --all > "${STAGE_DIR}/images/k
   while IFS= read -r _img; do log "    ${_img}"; done < "${STAGE_DIR}/images/k0s-images.list"
   # --concurrency=1 makes the tarball reproducible (deterministic image order).
   "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+    --platform "${BUNDLE_PLATFORM}" \
     -o "${STAGE_DIR}/images/k0s-images.tar" \
     < "${STAGE_DIR}/images/k0s-images.list" \
     || err "Failed to build k0s system-image bundle (k0s airgap bundle-artifacts)."
@@ -460,6 +462,7 @@ if [[ -s "${ADDON_LIST}" ]]; then
   while IFS= read -r _img; do log "    ${_img}"; done < "${ADDON_LIST}"
   log "Building add-on image bundle (pulls the images above, may take several minutes)..."
   "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+    --platform "${BUNDLE_PLATFORM}" \
     -o "${STAGE_DIR}/images/addon-images.tar" \
     < "${ADDON_LIST}" \
     || err "Failed to build add-on image bundle (k0s airgap bundle-artifacts)."
@@ -498,6 +501,7 @@ if [[ -n "${CLUSTER_CONFIG}" ]]; then
   sort -u "${WORKLOAD_LIST}" -o "${WORKLOAD_LIST}"
   log "Building selected CPU-only workload image bundle from ${CLUSTER_CONFIG}..."
   "${STAGE_DIR}/binaries/k0s" airgap bundle-artifacts --concurrency=1 \
+    --platform "${BUNDLE_PLATFORM}" \
     -o "${STAGE_DIR}/images/workload-images.tar" < "${WORKLOAD_LIST}" \
     || err "Failed to bundle selected CPU-only workload images"
 fi
@@ -519,6 +523,7 @@ if [[ "${CPU_ONLY_BUNDLE}" == "true" ]]; then
     --images-file "${INVENTORY_IMAGES}" \
     --image-lists-dir "${STAGE_DIR}/images" \
     --profile cpuOnly \
+    --target-platform "${BUNDLE_PLATFORM}" \
     --mirror-registry "${MIRROR_REGISTRY}" \
     --embedded-chart "${STAGE_DIR}/charts/$(basename "${EMBEDDED_LAS_CHART}")" \
     --output "${STAGE_DIR}/image-inventory.json" \

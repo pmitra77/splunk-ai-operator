@@ -50,6 +50,7 @@ write_yq_stub() {
   cat > "${target}" <<'YQ'
 #!/usr/bin/env bash
 set -euo pipefail
+[[ -n "${YQ_SENTINEL:-}" ]] && printf invoked > "${YQ_SENTINEL}"
 expression="${3:-}"
 input="${4:-}"
 case "${expression}" in
@@ -60,7 +61,7 @@ for item in json.load(sys.stdin).get("manifests", []):
     print(annotations.get("org.opencontainers.image.ref.name") or annotations.get("io.containerd.image.name") or "")'
     ;;
   '.aiPlatform.profile // ""')
-    if grep -q '^profile: full$' "${input}"; then printf 'full\n'; else printf 'cpuOnly\n'; fi
+    if grep -Eq '^[[:space:]]*profile:[[:space:]]*full$' "${input}"; then printf 'full\n'; else printf 'cpuOnly\n'; fi
     ;;
   '.cluster.airgap // false') printf 'true\n' ;;
   '.images.operator.image // ""') printf 'registry.internal/operator:v1\n' ;;
@@ -164,16 +165,29 @@ IMAGES
   cp "${WRAPPER}" "${root}/cluster_setup/install_from_airgap_bundle.sh"
   cp "${INVENTORY_HELPER}" "${root}/cluster_setup/build_airgap_image_inventory.py"
   printf 'fixture runtime validator\n' > "${root}/cluster_setup/validate_cpu_airgap_runtime.py"
-  printf '#!/usr/bin/env bash\nprintf invoked > "${INSTALLER_SENTINEL:?}"\n' \
-    > "${root}/cluster_setup/k0s_cluster_with_stack.sh"
+  cat > "${root}/cluster_setup/k0s_cluster_with_stack.sh" <<'INSTALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "validate-airgap-cpu-profile" ]]; then
+  printf invoked > "${VALIDATOR_SENTINEL:?}"
+  if grep -q '^invalid-airgap-profile: true$' "${CONFIG_FILE:?}"; then
+    printf 'cpuOnly air-gap profile rejects invalid fixture config\n' >&2
+    exit 1
+  fi
+  exit 0
+fi
+printf invoked > "${INSTALLER_SENTINEL:?}"
+INSTALLER
   chmod +x "${root}/cluster_setup/k0s_cluster_with_stack.sh"
   printf 'fixture artifacts\n' > "${root}/cluster_setup/artifacts.yaml"
   printf 'fixture splunk operator\n' > "${root}/cluster_setup/splunk-operator-cluster.yaml"
   printf 'fixture deployment helper\n' > "${root}/cluster_setup/las_deployment.py"
 
   cat > "${case_dir}/config.yaml" <<'CONFIG'
-profile: cpuOnly
-cluster-airgap: true
+cluster:
+  airgap: true
+aiPlatform:
+  profile: cpuOnly
 CONFIG
   write_inventory "${root}"
 
@@ -182,6 +196,7 @@ CONFIG
     corrupt-checksum) ;;
     missing-archive) rm "${root}/images/workload-images.tar" ;;
     config-closure) printf 'las-tag-mismatch: true\n' >> "${case_dir}/config.yaml" ;;
+    invalid-airgap-profile) printf 'invalid-airgap-profile: true\n' >> "${case_dir}/config.yaml" ;;
     missing-oci-ref)
       make_oci_archive "${root}/images/workload-images.tar" \
         registry.internal/operator:v1 registry.internal/slim:v1 \
@@ -206,7 +221,7 @@ PY
       ;;
     non-cpu)
       rm "${root}/bundle-profile.txt"
-      printf 'profile: full\n' > "${case_dir}/config.yaml"
+      printf 'aiPlatform:\n  profile: full\n' > "${case_dir}/config.yaml"
       ;;
     *) printf 'unknown fixture mode: %s\n' "${mode}" >&2; exit 2 ;;
   esac
@@ -228,7 +243,7 @@ PY
 
 make_malicious_archive() {
   local case_dir="$1" mode="$2"
-  printf 'profile: cpuOnly\n' > "${case_dir}/config.yaml"
+  printf 'aiPlatform:\n  profile: cpuOnly\n' > "${case_dir}/config.yaml"
   python3 - "${case_dir}/bundle.tar.gz" "${mode}" <<'PY'
 import io
 import sys
@@ -310,6 +325,7 @@ run_case() {
   make_command_stubs "${case_dir}/stubs"
   export COMMAND_SENTINEL="${case_dir}/command-invoked"
   export INSTALLER_SENTINEL="${case_dir}/installer-invoked"
+  export VALIDATOR_SENTINEL="${case_dir}/validator-invoked"
   expected_sha="$(hash_file "${case_dir}/bundle.tar.gz")"
   if [[ "${mode}" == "bundle-sha-mismatch" ]]; then
     expected_sha="$(printf '%064d' 0)"
@@ -343,10 +359,48 @@ run_case() {
     [[ -e "${COMMAND_SENTINEL}" ]] && cat "${COMMAND_SENTINEL}" >&2
     exit 1
   fi
+  if [[ "${name}" == "valid" && ! -e "${VALIDATOR_SENTINEL}" ]]; then
+    printf 'FAIL %s: validation did not invoke the real-profile validator entry point\n' "${name}" >&2
+    exit 1
+  fi
   PASSED=$((PASSED + 1))
   printf 'PASS %s\n' "${name}"
 }
 
+run_cpu_missing_external_hash_case() {
+  local case_dir="${TEST_ROOT}/cpu-missing-external-hash" output status=0
+  mkdir -p "${case_dir}"
+  make_fixture "${case_dir}" valid
+  make_command_stubs "${case_dir}/stubs"
+  export COMMAND_SENTINEL="${case_dir}/command-invoked"
+  export INSTALLER_SENTINEL="${case_dir}/installer-invoked"
+  export VALIDATOR_SENTINEL="${case_dir}/validator-invoked"
+  export YQ_SENTINEL="${case_dir}/yq-invoked"
+
+  if output="$(PATH="${case_dir}/stubs:${PATH}" bash "${WRAPPER}" \
+      --bundle "${case_dir}/bundle.tar.gz" \
+      --config "${case_dir}/config.yaml" \
+      --extract-dir "${case_dir}/extract" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  unset YQ_SENTINEL
+
+  if [[ "${status}" -eq 0 || "${output}" != *"requires --expected-bundle-sha256 before bundled tools can run"* ]]; then
+    printf 'FAIL cpu-missing-external-hash: expected early trust failure\n%s\n' "${output}" >&2
+    exit 1
+  fi
+  if [[ -e "${case_dir}/yq-invoked" || -e "${COMMAND_SENTINEL}" ||
+        -e "${INSTALLER_SENTINEL}" || -e "${case_dir}/extract" ]]; then
+    printf 'FAIL cpu-missing-external-hash: untrusted bundle content was used or extracted\n' >&2
+    exit 1
+  fi
+  PASSED=$((PASSED + 1))
+  printf 'PASS cpu-missing-external-hash\n'
+}
+
+run_cpu_missing_external_hash_case
 run_case valid valid pass "CPU-only bundle validation completed"
 run_case stale-preseed stale-preseed fail "Bundle extraction destination already exists"
 run_case bundle-sha-mismatch bundle-sha-mismatch fail "Bundle tarball SHA-256 does not match"
@@ -356,6 +410,7 @@ run_case checksum-duplicate-entry checksum-duplicate-entry fail "duplicate manif
 run_case checksum-traversal-entry checksum-traversal-entry fail "unsafe manifest path"
 run_case missing-archive missing-archive fail "Required CPU-only bundle artifact missing: images/workload-images.tar"
 run_case config-closure config-closure fail "does not contain configured Agent Runtime image"
+run_case invalid-airgap-profile invalid-airgap-profile fail "cpuOnly air-gap profile rejects invalid fixture config"
 run_case missing-oci-ref missing-oci-ref fail "OCI archive images/workload-images.tar is missing image registry.internal/launchpad:v1"
 run_case chart-mismatch chart-mismatch fail "embedded LAS chart digest does not match the inventory"
 run_case source-mismatch source-mismatch fail "source commit does not match bundle-versions.txt"

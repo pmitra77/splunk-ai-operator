@@ -1418,6 +1418,40 @@ class CPUAirgapRuntimeTests(unittest.TestCase):
         ):
             runtime.ensure_sanitized({"value": "https://user:pass@example.test"})
 
+    def test_evidence_redacts_private_registry_addresses(self):
+        evidence = {
+            "image": "10.0.0.5:5000/team/launchpad:v1",
+            "imageID": (
+                "docker-pullable://registry.internal/team/launchpad@sha256:"
+                + "a" * 64
+            ),
+            "public": "docker.io/library/postgres:16",
+            "ecr": "658391232643.dkr.ecr.us-west-2.amazonaws.com/team/image:v1",
+        }
+        redacted = runtime.redact_ecr_account_ids(evidence)
+        redacted = runtime.redact_private_registry_addresses(redacted)
+
+        self.assertEqual(
+            redacted["image"], "<redacted-registry>/team/launchpad:v1"
+        )
+        self.assertEqual(
+            redacted["imageID"],
+            "docker-pullable://<redacted-registry>/team/launchpad@sha256:"
+            + "a" * 64,
+        )
+        self.assertEqual(redacted["public"], "docker.io/library/postgres:16")
+        self.assertEqual(
+            redacted["ecr"],
+            "<redacted-account>.dkr.ecr.us-west-2.amazonaws.com/team/image:v1",
+        )
+        runtime.ensure_sanitized(redacted)
+        with self.assertRaisesRegex(
+            runtime.QualificationError, "private registry address"
+        ):
+            runtime.ensure_sanitized(
+                {"image": "docker-pullable://10.0.0.5:5000/team/image:v1"}
+            )
+
     def test_existing_evidence_prevents_replacement_before_pod_deletion(self):
         self.fixture.output.mkdir()
         existing = self.fixture.output / "mpr-129-evidence.md"

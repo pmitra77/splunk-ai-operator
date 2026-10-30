@@ -183,6 +183,9 @@ require_cmd() {
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 [[ -n "${BUNDLE_TARBALL}" ]] || err "No bundle specified. Use --bundle airgap-bundle-<date>.tar.gz"
 [[ -f "${BUNDLE_TARBALL}" ]] || err "Bundle file not found: ${BUNDLE_TARBALL}"
+if [[ -n "${CONFIG_FILE}" ]]; then
+  [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
+fi
 require_cmd tar
 require_cmd python3
 if [[ "${VALIDATE_ONLY}" == "true" && -z "${EXPECTED_BUNDLE_SHA256}" ]]; then
@@ -226,7 +229,7 @@ log ""
 # Inspect with Python's tar parser before invoking tar extraction. This avoids
 # platform-specific parsing of `tar -tv` output and rejects paths or member
 # types that could escape or redirect extraction.
-if ! BUNDLE_NAME="$(python3 - "${BUNDLE_TARBALL}" <<'PY'
+if ! BUNDLE_METADATA="$(python3 - "${BUNDLE_TARBALL}" <<'PY'
 import pathlib
 import sys
 import tarfile
@@ -234,6 +237,7 @@ import tarfile
 archive_path = sys.argv[1]
 roots = set()
 seen = set()
+members_by_name = {}
 try:
     with tarfile.open(archive_path, mode="r:gz") as archive:
         members = archive.getmembers()
@@ -253,6 +257,7 @@ try:
             if normalized in seen:
                 raise ValueError(f"bundle archive contains duplicate member: {normalized!r}")
             seen.add(normalized)
+            members_by_name[normalized] = member
             root = parts[0]
             if not root.startswith("airgap-bundle-") or root == "airgap-bundle-":
                 raise ValueError("bundle archive must contain exactly one airgap-bundle-* root")
@@ -264,13 +269,75 @@ try:
                 )
         if len(roots) != 1:
             raise ValueError("bundle archive must contain exactly one airgap-bundle-* root")
+        root = next(iter(roots))
+        profile = ""
+        profile_member = members_by_name.get(f"{root}/bundle-profile.txt")
+        if profile_member is not None:
+            if not profile_member.isfile() or profile_member.size > 64:
+                raise ValueError("bundle-profile.txt is not a small regular file")
+            stream = archive.extractfile(profile_member)
+            if stream is None:
+                raise ValueError("bundle-profile.txt could not be read")
+            profile = stream.read().decode("utf-8").strip()
+            if profile != "cpuOnly":
+                raise ValueError("unknown bundle profile")
 except (OSError, tarfile.TarError, ValueError) as exc:
     print(f"ERROR: {exc}", file=sys.stderr)
     raise SystemExit(1)
-print(next(iter(roots)))
+print(f"{root}\t{profile}")
 PY
 )"; then
   err "Bundle archive member validation failed"
+fi
+IFS=$'\t' read -r BUNDLE_NAME ARCHIVE_PROFILE <<< "${BUNDLE_METADATA}"
+
+# Determine whether the external config selects cpuOnly without executing any
+# file from the bundle. The bundled yq remains authoritative after the bundle's
+# externally recorded digest has been verified.
+CONFIG_PROFILE=""
+if [[ -n "${CONFIG_FILE}" ]]; then
+  CONFIG_PROFILE="$(python3 - "${CONFIG_FILE}" <<'PY'
+import re
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+section_indent = None
+for raw in lines:
+    if not raw.strip() or raw.lstrip().startswith("#"):
+        continue
+    if "\t" in raw:
+        print("unknown")
+        raise SystemExit
+    indent = len(raw) - len(raw.lstrip(" "))
+    content = raw.strip()
+    if section_indent is None:
+        if indent == 0 and re.match(r"aiPlatform\s*:", content):
+            if re.fullmatch(r"aiPlatform\s*:\s*(?:#.*)?", content):
+                section_indent = indent
+            else:
+                print("unknown")
+                raise SystemExit
+        continue
+    if indent <= section_indent:
+        break
+    match = re.fullmatch(r"profile\s*:\s*([^#]+?)\s*(?:#.*)?", content)
+    if match:
+        value = match.group(1).strip().strip("'\"")
+        print(value if value in {"cpuOnly", "full"} else "unknown")
+        raise SystemExit
+    if re.match(r"profile\s*:", content):
+        print("unknown")
+        raise SystemExit
+print("")
+PY
+)"
+fi
+
+CPU_ONLY_BUNDLE=false
+[[ "${ARCHIVE_PROFILE}" == "cpuOnly" ]] && CPU_ONLY_BUNDLE=true
+if [[ "${CPU_ONLY_BUNDLE}" == "true" || "${CONFIG_PROFILE}" == "cpuOnly" || "${CONFIG_PROFILE}" == "unknown" ]]; then
+  [[ -n "${EXPECTED_BUNDLE_SHA256}" ]] ||
+    err "CPU-only bundle or config requires --expected-bundle-sha256 before bundled tools can run"
 fi
 
 log "Extracting bundle..."
@@ -373,7 +440,6 @@ log "  otel        : ${OTEL_CHART_VERSION}"
 # Check the selected workload closure before modifying the installer host or
 # reaching any cluster node. A bundle prepared for another config must fail
 # here, rather than leaving a partially installed private cluster.
-CPU_ONLY_BUNDLE=false
 if [[ -f "${BUNDLE_DIR}/bundle-profile.txt" ]]; then
   [[ "$(cat "${BUNDLE_DIR}/bundle-profile.txt")" == "cpuOnly" ]] ||
     err "Unknown bundle profile"
@@ -382,7 +448,6 @@ if [[ -f "${BUNDLE_DIR}/bundle-profile.txt" ]]; then
     err "CPU-only bundle requires an explicit --config or CONFIG_FILE"
 fi
 if [[ -n "${CONFIG_FILE}" ]]; then
-  [[ -f "${CONFIG_FILE}" ]] || err "Config file not found: ${CONFIG_FILE}"
   BUNDLE_YQ="${BUNDLE_DIR}/binaries/yq"
   [[ -x "${BUNDLE_YQ}" ]] || err "Bundled yq is missing or not executable"
   if [[ "$("${BUNDLE_YQ}" eval -r '.aiPlatform.profile // ""' "${CONFIG_FILE}")" == "cpuOnly" ]]; then
@@ -520,6 +585,9 @@ fi
 if [[ "${VALIDATE_ONLY}" == "true" ]]; then
   [[ "${CPU_ONLY_BUNDLE}" == "true" ]] ||
     err "--validate-only is supported only for CPU-only bundles"
+  PATH="${BUNDLE_DIR}/binaries:${PATH}" \
+    CONFIG_FILE="${CONFIG_FILE}" AIRGAP_MODE=true \
+    bash "${INSTALLER_SCRIPT}" validate-airgap-cpu-profile
   log "CPU-only bundle validation completed; no privileged host or cluster changes made"
   exit 0
 fi

@@ -36,6 +36,12 @@ PRIVATE_IDENTIFIER_RE = re.compile(
 ECR_ACCOUNT_RE = re.compile(
     r"(?<![0-9])[0-9]{12}(?=\.dkr\.ecr(?:-fips)?\.[^/\s]+)", re.IGNORECASE
 )
+PRIVATE_REGISTRY_RE = re.compile(
+    r"(?P<prefix>(?:docker-pullable|docker)://)?"
+    r"(?P<host>(?:[0-9]{1,3}\.){3}[0-9]{1,3}|\[[0-9a-f:]+\]|localhost|"
+    r"[a-z0-9.-]+\.(?:internal|local))(?::[0-9]+)?/",
+    re.IGNORECASE,
+)
 CHECKSUM_LINE_RE = re.compile(r"^([0-9a-f]{64})[ \t]+[*]?(.+)$")
 SENSITIVE_KEY_RE = re.compile(
     r"(password|passwd|secret(access)?key|accesskeyid|api[_-]?key|token|licensekey|"
@@ -1511,12 +1517,15 @@ def ensure_sanitized(value: Any, path: str = "evidence") -> None:
     elif isinstance(value, list):
         for index, child in enumerate(value):
             ensure_sanitized(child, f"{path}[{index}]")
-    elif isinstance(value, str) and any(
-        pattern.search(value) for pattern in SENSITIVE_VALUE_RES
-    ):
-        raise QualificationError(
-            f"refusing to write credential-shaped evidence value: {path}"
-        )
+    elif isinstance(value, str):
+        if any(pattern.search(value) for pattern in SENSITIVE_VALUE_RES):
+            raise QualificationError(
+                f"refusing to write credential-shaped evidence value: {path}"
+            )
+        if PRIVATE_REGISTRY_RE.search(value):
+            raise QualificationError(
+                f"refusing to write private registry address: {path}"
+            )
 
 
 def redact_ecr_account_ids(value: Any) -> Any:
@@ -1526,6 +1535,22 @@ def redact_ecr_account_ids(value: Any) -> Any:
         return [redact_ecr_account_ids(child) for child in value]
     if isinstance(value, str):
         return ECR_ACCOUNT_RE.sub("<redacted-account>", value)
+    return value
+
+
+def redact_private_registry_addresses(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: redact_private_registry_addresses(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_private_registry_addresses(child) for child in value]
+    if isinstance(value, str):
+        return PRIVATE_REGISTRY_RE.sub(
+            lambda match: f"{match.group('prefix') or ''}<redacted-registry>/",
+            value,
+        )
     return value
 
 
@@ -1891,6 +1916,7 @@ def qualify(
         "replacement": replacement,
     }
     evidence = redact_ecr_account_ids(evidence)
+    evidence = redact_private_registry_addresses(evidence)
     ensure_sanitized(evidence)
     atomic_write(json_path, json.dumps(evidence, indent=2, sort_keys=True) + "\n")
     atomic_write(markdown_path, evidence_markdown(evidence))
